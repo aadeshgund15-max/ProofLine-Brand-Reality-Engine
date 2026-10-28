@@ -73,13 +73,13 @@ export const authApi = {
     if (!data.session) throw new ApiError('Sign-in succeeded but no Proofline session was returned.')
     return { token: data.session.access_token }
   },
-  async register(email: string, name: string, password: string) {
-    const { data, error } = await requireSupabase().auth.signUp({ email: email.trim(), password, options: { data: { name: name.trim() }, emailRedirectTo: `${window.location.origin}/?verified=1` } })
+  async register(email: string, name: string, password: string, emailRedirectTo: string) {
+    const { data, error } = await requireSupabase().auth.signUp({ email: email.trim(), password, options: { data: { name: name.trim() }, emailRedirectTo } })
     if (error) throw new ApiError(error.message)
     return { id: data.user?.id ?? '', email: data.user?.email ?? email.trim(), verification_required: !data.session as true }
   },
-  async resendVerification(email: string) {
-    const { error } = await requireSupabase().auth.resend({ type: 'signup', email: email.trim(), options: { emailRedirectTo: `${window.location.origin}/?verified=1` } })
+  async resendVerification(email: string, emailRedirectTo: string) {
+    const { error } = await requireSupabase().auth.resend({ type: 'signup', email: email.trim(), options: { emailRedirectTo } })
     if (error) throw new ApiError(error.message)
     return { accepted: true as const }
   },
