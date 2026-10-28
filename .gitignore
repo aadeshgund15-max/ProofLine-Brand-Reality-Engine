@@ -1,0 +1,35 @@
+node_modules/
+dist/
+.npm-cache/
+.env.local
+.env.*.local
+*.tsbuildinfo
+
+.env
+backend/.venv/
+backend/.storage/
+__pycache__/
+*.py[cod]
+
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Dependencies and generated files
+node_modules/
+**/node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+dist/
+build/
+
+# Local editor and operating-system files
+.vscode/
+.DS_Store
+Thumbs.db
