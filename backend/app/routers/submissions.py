@@ -92,8 +92,11 @@ def _store_version(conn: Connection, m: Member, submission_id: UUID, version_no:
     vid = uuid4()
     key = None
     if original is not None:
-        key = storage.put(f"{m.workspace_id}/{submission_id}/{vid}-{meta['original_filename'] or 'upload'}",
-                          original, meta["mime_type"] or "application/octet-stream")
+        try:
+            key = storage.put(f"{m.workspace_id}/{submission_id}/{vid}-{meta['original_filename'] or 'upload'}",
+                              original, meta["mime_type"] or "application/octet-stream")
+        except storage.StorageError as exc:
+            raise HTTPException(503, str(exc)) from exc
     src = meta["source_type"] if meta["source_type"] != "file" else ext.source_type
     row = q1(conn, """insert into submission_versions (id, submission_id, workspace_id, version_no, source_type,
                         original_filename, original_url, storage_path, mime_type, size_bytes, retrieved_at, extracted_text,
