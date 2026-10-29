@@ -21,7 +21,7 @@ export interface SubmissionDetail extends Submission { revision: Revision; findi
 export interface Decision { id: string; sub: string; rev: string; reviewer: string; decision: string; rationale: string; created: string }
 export interface Impact { id: string; ws: string; sub: string; rev: string; source: string; old_version: string; new_version: string; state: string; rationale: string | null }
 export interface AuditEvent { id: string; ws: string; actor: string; action: string; target: string; detail: Record<string, unknown>; created: string }
-export interface DashboardSummary { facts: number; rules: number; submissions: number; review_runs: number; open_findings: number; open_findings_high: number; impact_review_required: number; recent_activity: Array<{ id: string; event_type: string; summary: string; created_at: string }> }
+export interface DashboardSummary { facts: number; approved_facts: number; rules: number; submissions: number; review_runs: number; open_findings: number; open_findings_high: number; impact_review_required: number; recent_activity: Array<{ id: string; event_type: string; summary: string; created_at: string }> }
 export interface Member { user_id: string; role: Role; email: string; name: string }
 export interface ApiErrorBody { error?: { code?: string; request_id?: string } }
 

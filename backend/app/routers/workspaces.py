@@ -132,6 +132,9 @@ def dashboard(m: Member = Depends(member_of()), conn: Connection = Depends(get_c
     one = lambda sql: q1(conn, sql, w=w)["n"]
     return {
         "facts": one("select count(*) n from brand_facts where workspace_id = :w"),
+        "approved_facts": one("""select count(*) n from brand_fact_versions v
+                                 join brand_facts f on f.current_version_id = v.id
+                                 where f.workspace_id = :w and v.status = 'approved'"""),
         "rules": one("select count(*) n from brand_rules where workspace_id = :w"),
         "submissions": one("select count(*) n from submissions where workspace_id = :w"),
         "review_runs": one("select count(*) n from review_runs where workspace_id = :w"),
