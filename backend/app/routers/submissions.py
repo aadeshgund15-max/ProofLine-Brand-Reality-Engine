@@ -87,6 +87,17 @@ async def _ingest(source_type: str, text: Optional[str], url: Optional[str], fil
     raise HTTPException(422, "source_type must be text, file or url")
 
 
+async def _ingest_evidence(file: UploadFile):
+    data = await file.read(settings.max_upload_bytes + 1)
+    kind, err = validate_upload(data, file.filename or "", settings.max_upload_bytes)
+    if err:
+        raise HTTPException(422, err)
+    if kind not in ("text", "pdf", "docx"):
+        raise HTTPException(422, "Evidence currently supports TXT, PDF, and DOCX files.")
+    ext = _extract_with_timeout(kind, extract_file, kind, data)
+    return data, kind, ext
+
+
 def _store_version(conn: Connection, m: Member, submission_id: UUID, version_no: int, ext: ExtractionResult,
                    meta: dict, original: Optional[bytes]) -> dict:
     vid = uuid4()
@@ -143,6 +154,47 @@ async def create_version(submission_id: UUID, source_type: str = Form(...), text
           f"Version {n} of “{sub['title']}” created (extraction {ext.status})",
           {"version_id": str(ver["id"]), "content_hash": ver["content_hash"]})
     return {"id": submission_id, "version": {**ver, "preview": ext.text[:600], "warnings": ext.warnings}}
+
+
+@router.post("/submission-versions/{version_id}/evidence", status_code=201)
+async def add_evidence(version_id: UUID, file: UploadFile = File(...),
+                        description: Optional[str] = Form(None),
+                        m: Member = Depends(member_of(*auth.EDIT_ROLES)), conn: Connection = Depends(get_conn)):
+    sv = q1(conn, "select id, submission_id from submission_versions where id = :v and workspace_id = :w",
+            v=version_id, w=m.workspace_id)
+    if not sv:
+        raise HTTPException(404, "Submission version not found")
+    data, kind, ext = await _ingest_evidence(file)
+    try:
+        path = storage.put(f"{m.workspace_id}/{sv['submission_id']}/{version_id}/evidence/{uuid4()}-{file.filename or 'evidence'}",
+                           data, file.content_type or "application/octet-stream")
+    except storage.StorageError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    row = q1(conn, """insert into submission_evidence
+                      (workspace_id, submission_version_id, original_filename, storage_path, mime_type,
+                       size_bytes, content_hash, description, extracted_text, extraction_status,
+                       extraction_warnings, segments, created_by)
+                      values (:w,:v,:fn,:sp,:mt,:sz,:h,:d,:txt,:st,cast(:warn as jsonb),cast(:seg as jsonb),:u)
+                      returning id, original_filename, mime_type, size_bytes, content_hash, description,
+                                extraction_status, extraction_warnings, extracted_text, segments, created_at""",
+             w=m.workspace_id, v=version_id, fn=file.filename or "evidence", sp=path,
+             mt=file.content_type or "application/octet-stream", sz=len(data),
+             h=hashlib.sha256(data).hexdigest(), d=(description or "").strip() or None,
+             txt=ext.text, st=ext.status, warn=jb(ext.warnings),
+             seg=jb([s.as_dict() for s in ext.segments]), u=m.user.id)
+    audit(conn, m.workspace_id, m.user.id, "evidence.added", "submission_version", version_id,
+          f"Evidence added: {row['original_filename']}", {"evidence_id": str(row["id"]), "status": ext.status})
+    return row
+
+
+@router.get("/submission-versions/{version_id}/evidence")
+def list_evidence(version_id: UUID, m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
+    if not q1(conn, "select 1 from submission_versions where id = :v and workspace_id = :w", v=version_id, w=m.workspace_id):
+        raise HTTPException(404, "Submission version not found")
+    return q(conn, """select id, original_filename, mime_type, size_bytes, content_hash, description,
+                             extraction_status, extraction_warnings, extracted_text, segments, created_at
+                      from submission_evidence where submission_version_id = :v
+                      order by created_at""", v=version_id)
 
 
 _LIST_SQL = """

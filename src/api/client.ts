@@ -1,4 +1,4 @@
-import type { ApiErrorBody, AuditEvent, BrandSource, Decision, Finding, Impact, Member, Profile, ReviewFinding, ReviewResult, Session, SourceVersion, SubmissionDetail, Workspace } from './contracts/index'
+import type { ApiErrorBody, AuditEvent, BrandSource, DashboardSummary, Decision, Finding, Impact, Member, Profile, ReviewFinding, ReviewResult, Session, SourceVersion, SubmissionDetail, SubmissionEvidence, Workspace } from './contracts/index'
 import { requireSupabase, supabase } from './supabase'
 
 const apiBase = (import.meta.env.VITE_API_BASE ?? '').trim().replace(/\/$/, '')
@@ -93,6 +93,9 @@ export const authApi = {
 }
 
 export const workspaceApi = {
+  summary(workspaceId: string) {
+    return get<DashboardSummary>(`/workspaces/${workspaceId}/dashboard`)
+  },
   async create(name: string) {
     const created = await post<RawWorkspace>('/workspaces', { name })
     await post(`/workspaces/${created.id}/profiles`, { name: 'Brand profile', description: 'Default Proofline brand profile' })
@@ -147,7 +150,7 @@ export const rulesApi = {
 export const submissionApi = {
   async list(workspaceId: string) {
     const rows = await get<Array<RawSubmission & { version_id: string; version_no: number; last_run_status: string | null; last_decision: string | null; open_impacts: number; open_findings: number }>>(`/workspaces/${workspaceId}/submissions`)
-    return rows.map(row => ({ id: row.id, ws: workspaceId, title: row.title, status: row.last_decision === 'approved' || row.last_decision === 'rejected' || row.last_decision === 'changes_requested' ? row.last_decision : row.last_run_status && row.last_run_status !== 'failed' ? 'in_review' as const : 'draft' as const, owner: '—', revision: { id: row.version_id, sub: row.id, no: row.version_no, text: '', hash: '', created: row.created_at } }))
+    return rows.map(row => ({ id: row.id, ws: workspaceId, title: row.title, status: row.last_decision === 'approved' || row.last_decision === 'rejected' || row.last_decision === 'changes_requested' ? row.last_decision : row.last_run_status && row.last_run_status !== 'failed' ? 'in_review' as const : 'awaiting_evidence' as const, owner: '—', revision: { id: row.version_id, sub: row.id, no: row.version_no, text: '', hash: '', created: row.created_at } }))
   },
   async create(workspaceId: string, title: string, text: string, options: { sourceType?: string; file?: File; url?: string } = {}) {
     const profileId = await ensureBrandProfile(workspaceId)
@@ -160,18 +163,25 @@ export const submissionApi = {
     const currentVersion = await get<{ id: string; submission_id: string; version_no: number; extracted_text: string; content_hash: string; created_at: string }>(`/workspaces/${workspaceId}/submission-versions/${raw.current_version_id}`)
     const run = raw.review_runs.filter(item => item.submission_version_id === raw.current_version_id).sort((a, b) => b.started_at.localeCompare(a.started_at))[0]
     const latestRun = run ? await get<RawRun & { findings: RawFinding[] }>(`/workspaces/${workspaceId}/review-runs/${run.id}`) : null
+    const evidence = await get<SubmissionEvidence[]>(`/workspaces/${workspaceId}/submission-versions/${raw.current_version_id}/evidence`)
     const findings = latestRun ? await Promise.all(latestRun.findings.map(async finding => {
       const detail = await get<{ evidence: Array<{ excerpt: string | null; source_url: string | null; access_status: string | null }> }>(`/workspaces/${workspaceId}/findings/${finding.id}`)
       return { ...toFinding(finding), evidence: detail.evidence.map(e => ({ snippet: e.excerpt ?? undefined, source_url: e.source_url ?? undefined, status: e.access_status ?? undefined })) }
     })) : null
     const decisions = raw.decisions.map(d => ({ id: d.id, sub: submissionId, rev: d.submission_version_id, reviewer: d.decided_by ?? 'Unknown reviewer', decision: d.decision, rationale: d.comment ?? '', created: d.decided_at }))
     const decision = decisions.find(d => d.rev === raw.current_version_id)
-    const status = decision?.decision === 'approved' || decision?.decision === 'rejected' || decision?.decision === 'changes_requested' ? decision.decision : latestRun && latestRun.status !== 'failed' ? 'in_review' : 'draft'
-    return { id: raw.id, ws: workspaceId, title: raw.title, status, owner: '—', revision: { id: currentVersion.id, sub: submissionId, no: currentVersion.version_no, text: currentVersion.extracted_text, hash: currentVersion.content_hash, created: currentVersion.created_at }, findings, decisions }
+    const status = decision?.decision === 'approved' || decision?.decision === 'rejected' || decision?.decision === 'changes_requested' ? decision.decision : latestRun && latestRun.status !== 'failed' ? 'in_review' : evidence.length ? 'ready_for_review' : 'awaiting_evidence'
+    return { id: raw.id, ws: workspaceId, title: raw.title, status, owner: '—', revision: { id: currentVersion.id, sub: submissionId, no: currentVersion.version_no, text: currentVersion.extracted_text, hash: currentVersion.content_hash, created: currentVersion.created_at }, findings, decisions, evidence, assessments: (latestRun as (RawRun & { evidence_assessments?: SubmissionDetail['assessments'] }) | null)?.evidence_assessments ?? [] }
   },
   async revise(workspaceId: string, submissionId: string, text: string) {
     const profileId = await ensureBrandProfile(workspaceId)
     return request(`/workspaces/${workspaceId}/submissions/${submissionId}/versions`, { method: 'POST', form: submissionForm(profileId, 'Revision', 'text', text) })
+  },
+  async addEvidence(workspaceId: string, versionId: string, file: File, description?: string) {
+    const form = new FormData()
+    form.append('file', file)
+    if (description?.trim()) form.append('description', description.trim())
+    return request<SubmissionEvidence>(`/workspaces/${workspaceId}/submission-versions/${versionId}/evidence`, { method: 'POST', form })
   },
 }
 export const reviewApi = {

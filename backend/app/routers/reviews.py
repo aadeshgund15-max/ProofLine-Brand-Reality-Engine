@@ -14,12 +14,36 @@ from app import auth
 from app.audit import audit
 from app.auth import Member, member_of
 from app.config import settings
-from app.db import ex, get_conn, q, q1
+from app.db import ex, get_conn, jb, q, q1
+from app.extract import locate
 from app.providers.base import get_llm_provider, get_search_provider
 from app.services.review import compute_review, load_reference_versions, persist_review, record_failed_run
 
 router = APIRouter(prefix="/api/workspaces/{workspace_id}")
 _hits: dict[str, deque] = defaultdict(deque)
+
+
+def _assess_evidence(claim_text: str, evidence_text: str) -> tuple[str, str, str | None]:
+    """Conservative deterministic baseline; it reports overlap, never invents proof."""
+    claim = claim_text.lower()
+    proof = evidence_text.lower()
+    claim_terms = {word.strip(".,!?;:()[]{}\"'") for word in claim.split() if len(word.strip(".,!?;:()[]{}\"'")) > 3}
+    proof_terms = {word.strip(".,!?;:()[]{}\"'") for word in proof.split() if len(word.strip(".,!?;:()[]{}\"'")) > 3}
+    if not proof.strip():
+        return "unable_to_determine", "The evidence contains no readable text.", None
+    overlap = claim_terms & proof_terms
+    if not overlap:
+        return "insufficient_evidence", "No claim terms were found in the extracted evidence.", proof[:500]
+    proof_words = proof.replace(".", " ").replace(",", " ").split()
+    negated = any(
+        any(word in {"not", "no", "never", "without"} for word in proof_words[max(0, proof_words.index(term) - 3):proof_words.index(term)])
+        for term in overlap if term in proof_words
+    )
+    if negated:
+        return "contradicted", "The extracted evidence explicitly negates part of the claim.", proof[:500]
+    if len(overlap) < max(2, len(claim_terms) // 4):
+        return "partially_supported", "Some claim terms appear in the extracted evidence, but the claim is not fully established.", proof[:500]
+    return "supported", "The extracted evidence contains terms from the claim.", proof[:500]
 
 
 def _rate_limit(user_id: str) -> None:
@@ -39,6 +63,12 @@ def run_review(version_id: UUID, m: Member = Depends(member_of()), conn: Connect
             v=version_id, w=m.workspace_id)
     if not sv:
         raise HTTPException(404, "Version not found")
+    evidence = q(conn, """select id, extracted_text, extraction_status, extraction_warnings, segments
+                          from submission_evidence where submission_version_id = :v order by created_at""", v=version_id)
+    if not evidence:
+        raise HTTPException(409, "At least one supporting evidence file is required before review.")
+    if any(e["extraction_status"] in ("failed", "empty", "unsupported") for e in evidence):
+        raise HTTPException(409, "Every supporting evidence file must be processed successfully before review.")
     if sv["extraction_status"] in ("failed", "empty", "unsupported"):
         raise HTTPException(409, f"This version cannot be reviewed because extraction {sv['extraction_status']}. "
                                  "Fix the content and submit a new version.")
@@ -50,6 +80,14 @@ def run_review(version_id: UUID, m: Member = Depends(member_of()), conn: Connect
         run_id = record_failed_run(m.workspace_id, version_id, m.user.id, f"{type(e).__name__}")
         raise HTTPException(500, f"The review failed and was recorded as failed (run {run_id}). No findings were saved.")
     run_id = persist_review(conn, workspace_id=m.workspace_id, sv=sv, user_id=m.user.id, c=computed)
+    for item in evidence:
+        assessment, explanation, excerpt = _assess_evidence(sv["extracted_text"] or "", item["extracted_text"] or "")
+        location = locate(item["segments"] or [], 0)
+        ex(conn, """insert into evidence_assessments
+                    (workspace_id, submission_version_id, evidence_id, review_run_id, assessment, explanation, excerpt, location)
+                    values (:w,:v,:e,:r,:a,:x,:q,cast(:loc as jsonb))""",
+           w=m.workspace_id, v=version_id, e=item["id"], r=run_id, a=assessment, x=explanation, q=excerpt,
+           loc=jb(location) if location else None)
     return get_run(run_id, m, conn)
 
 
@@ -74,7 +112,12 @@ def get_run(run_id: UUID, m: Member = Depends(member_of()), conn: Connection = D
     rules = q(conn, """select v.id, r.key, v.version_no, v.rule_type from review_run_rule_versions x
                        join brand_rule_versions v on v.id = x.rule_version_id join brand_rules r on r.id = v.rule_id
                        where x.review_run_id = :r""", r=run_id)
-    return {**run, "findings": findings, "fact_versions_used": facts, "rule_versions_used": rules}
+    assessments = q(conn, """select a.id, a.evidence_id, e.original_filename, e.extraction_status,
+                                    a.assessment, a.explanation, a.excerpt, a.location, a.created_at
+                             from evidence_assessments a join submission_evidence e on e.id = a.evidence_id
+                             where a.review_run_id = :r order by a.created_at""", r=run_id)
+    return {**run, "findings": findings, "fact_versions_used": facts, "rule_versions_used": rules,
+            "evidence_assessments": assessments}
 
 
 @router.get("/findings/{finding_id}")
@@ -152,6 +195,19 @@ def record_decision(version_id: UUID, body: DecisionIn, m: Member = Depends(memb
              r=body.review_run_id, v=version_id)
     if not run or run["status"] == "failed":
         raise HTTPException(422, "review_run_id must be a completed review run of this exact version")
+    if body.decision == "approved":
+        gate = q1(conn, """select count(*) total,
+                                  count(*) filter (where e.extraction_status in ('complete','partial')) processed,
+                                  count(a.id) assessments
+                           from submission_evidence e
+                           left join evidence_assessments a on a.evidence_id = e.id and a.review_run_id = :r
+                           where e.submission_version_id = :v""", v=version_id, r=run["id"])
+        if not gate or not gate["total"] or gate["processed"] != gate["total"] or gate["assessments"] != gate["total"]:
+            raise HTTPException(409, "Approval requires successfully processed evidence and a complete evidence analysis.")
+        concerns = q1(conn, """select count(*) n from evidence_assessments
+                               where review_run_id = :r and assessment <> 'supported'""", r=run["id"])["n"]
+        if concerns and not (body.comment or "").strip():
+            raise HTTPException(422, "A reviewer explanation is required to override contradictory or insufficient evidence.")
     dec = q1(conn, """insert into review_decisions (workspace_id, submission_version_id, review_run_id, decision, comment, decided_by)
                       values (:w,:v,:r,:d,:c,:u) returning id, decided_at""",
              w=m.workspace_id, v=version_id, r=run["id"], d=body.decision, c=body.comment, u=m.user.id)

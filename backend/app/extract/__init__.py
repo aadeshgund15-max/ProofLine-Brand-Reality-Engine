@@ -97,7 +97,7 @@ def _failed(kind: str, msg: str) -> ExtractionResult:
 
 # ------------------------------------------------------------ detection
 def sniff(data: bytes, filename: str = "") -> Optional[str]:
-    """Detect the content type from bytes. Returns docx|pdf|pptx|image|None."""
+    """Detect the content type from bytes. Plain text is accepted only with a .txt name."""
     if data[:5] == b"%PDF-":
         return "pdf"
     if data[:4] == b"PK\x03\x04":
@@ -113,6 +113,12 @@ def sniff(data: bytes, filename: str = "") -> Optional[str]:
     if (data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff" or data[:2] == b"BM"
             or data[:4] in (b"II*\x00", b"MM\x00*") or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")):
         return "image"
+    if filename.lower().endswith(".txt"):
+        try:
+            data.decode("utf-8")
+            return "text"
+        except UnicodeDecodeError:
+            return None
     return None
 
 
@@ -129,10 +135,10 @@ def validate_upload(data: bytes, filename: str, max_bytes: int) -> tuple[Optiona
         except zipfile.BadZipFile:
             return None, "The file appears to be corrupted (it is not a valid DOCX/PPTX archive)."
     if kind is None:
-        return None, ("Unsupported or unrecognised file. Supported: DOCX, text-based PDF, PPTX, "
+        return None, ("Unsupported or unrecognised file. Supported: TXT, DOCX, text-based PDF, PPTX, "
                       "PNG/JPEG/BMP/TIFF/WEBP images.")
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    expected = {"docx": {"docx"}, "pdf": {"pdf"}, "pptx": {"pptx"},
+    expected = {"text": {"txt"}, "docx": {"docx"}, "pdf": {"pdf"}, "pptx": {"pptx"},
                 "image": {"png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"}}[kind]
     if ext and ext not in expected:
         return None, f"The file extension .{ext} does not match its content ({kind})."
@@ -390,6 +396,8 @@ def extract_html(html: bytes | str, url: str, truncated: bool = False) -> Extrac
 
 
 def extract_file(kind: str, data: bytes) -> ExtractionResult:
+    if kind == "text":
+        return extract_text(data.decode("utf-8", "replace"))
     if kind == "docx":
         return extract_docx(data)
     if kind == "pdf":

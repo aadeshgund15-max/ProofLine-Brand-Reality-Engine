@@ -8,6 +8,7 @@ The frontend talks to the FastAPI service under `/api` (local Vite proxy: port 8
 - Workspace setup: `POST /api/workspaces`; `/api/workspaces/{w}/profiles`, `/members`, `/dashboard`.
 - Library: `/api/workspaces/{w}/facts`, `/facts/{id}`, `/rules`, `/rules/{id}`, plus `PUT` for immutable new versions; `/sources` for references.
 - Submissions: multipart `POST /api/workspaces/{w}/submissions` and `/submissions/{id}/versions`; `GET /submissions`, `/submissions/{id}`, `/submission-versions/{id}`.
+- Evidence: multipart `POST /api/workspaces/{w}/submission-versions/{v}/evidence` for private TXT/PDF/DOCX proof files; `GET /submission-versions/{v}/evidence` returns extraction status, warnings, segments, and extracted text.
 - Reviews: `POST /submission-versions/{id}/review`, `GET /review-runs/{id}`, `GET /findings/{id}`, `PATCH /findings/{id}/status`, and `POST /submission-versions/{id}/decisions`.
 - Impact/audit: `GET /impacts`, `GET /impacts/{id}`, and `GET /audit`.
 
@@ -23,4 +24,5 @@ Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in `.env.local`. Set matchi
 - Decisions require a successful review run for the exact current submission version. Requesting changes or rejecting requires a comment.
 - Impacts resolve through a review run started after the relevant change and a human decision; there is no dismiss-impact route.
 - Upload extraction can be partial, empty, unsupported, or fail. The review API refuses unreviewable versions.
+- A review requires at least one successfully processed evidence file for the exact submission version. Approval requires a complete evidence assessment; a reviewer explanation is required to override contradictory or insufficient evidence.
 - Without configured LLM/search providers, those review stages are unavailable; the API reports warnings rather than claiming a complete verification.
