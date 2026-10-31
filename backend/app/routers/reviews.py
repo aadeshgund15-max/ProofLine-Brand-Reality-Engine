@@ -10,13 +10,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import Connection
 
-from app import auth
+from app import auth, storage
 from app.audit import audit
 from app.auth import Member, member_of
 from app.config import settings
+from app.core.governance import assess_review
 from app.db import ex, get_conn, jb, q, q1
 from app.extract import locate
 from app.providers.base import get_llm_provider, get_search_provider
+from app.services.product_intelligence import review_gate
 from app.services.review import compute_review, load_reference_versions, persist_review, record_failed_run
 
 router = APIRouter(prefix="/api/workspaces/{workspace_id}")
@@ -74,15 +76,61 @@ def run_review(version_id: UUID, m: Member = Depends(member_of()), conn: Connect
                                  "Fix the content and submit a new version.")
     facts, rules = load_reference_versions(conn, m.workspace_id, sv["brand_profile_id"])
     brand = q1(conn, "select name from brand_profiles where id = :b", b=sv["brand_profile_id"])
+    palette = q1(conn, """select colors from brand_palette_versions where workspace_id=:w and brand_profile_id=:p
+                          order by version_no desc limit 1""", w=m.workspace_id, p=sv["brand_profile_id"])
+    product = q1(conn, """select p.id,p.product_name,p.brand,p.manufacturer,p.model_number,p.product_category,p.market,
+                              p.identity_status,r.id research_run_id,r.status research_status,r.coverage
+                       from submission_product_links l join products p on p.id=l.product_id
+                       left join lateral (select id,status,coverage from product_research_runs where product_id=p.id
+                       order by created_at desc limit 1) r on true
+                       where l.submission_version_id=:v and l.workspace_id=:w""", v=version_id, w=m.workspace_id)
+    product_context = " ".join(filter(None, [product.get("brand"), product.get("product_name"),
+                         product.get("manufacturer"), product.get("model_number"), product.get("product_category"),
+                         product.get("market")])) if product else ""
+    product_sources = []
+    if product and product.get("research_run_id"):
+        product_sources = q(conn, """select s.id,s.title,s.url,s.publisher,s.published_at,s.extraction_status,
+                                      s.extracted_text,s.research_run_id,
+                                      s.access_status,s.product_match_status,
+                                      (select array_agg(distinct q.query_text order by q.query_text)
+                                       from product_research_query_sources x
+                                       join product_research_queries q on q.id=x.query_id
+                                       where x.source_id=s.id) search_queries
+                               from product_research_sources s
+                               where s.product_id=:p and s.research_run_id=:r
+                                 and s.access_status='ok' and s.product_match_status='matched_by_identifier'
+                                 and length(trim(s.extracted_text)) > 0
+                               order by s.retrieved_at desc limit 12""",
+                           p=product["id"], r=product["research_run_id"])
+    image_bytes = storage.get(sv["storage_path"]) if sv["source_type"] == "image" and sv.get("storage_path") else None
     try:
-        computed = compute_review(sv, facts, rules, get_search_provider(), get_llm_provider(), brand["name"] if brand else "")
+        computed = compute_review(sv, facts, rules, get_search_provider(), get_llm_provider(),
+                                  " ".join(filter(None, [brand["name"] if brand else "", product_context])), image_bytes=image_bytes,
+                                  approved_colors=palette["colors"] if palette else None,
+                                  product_sources=product_sources)
+        product_status, product_message = review_gate(product)
+        computed.stages["product_intelligence"] = {
+            "status": product_status,
+            "message": product_message + (" Claim searches include the product identifiers." if product else " Link a product profile before review."),
+            "product_id": str(product["id"]) if product else None,
+            "research_run_id": str(product["research_run_id"]) if product and product.get("research_run_id") else None,
+            "coverage": product.get("coverage") if product else None,
+        }
+        evidence_results = []
+        for item in evidence:
+            assessment, explanation, excerpt = _assess_evidence(sv["extracted_text"] or "", item["extracted_text"] or "")
+            evidence_results.append((item, assessment, explanation, excerpt, locate(item["segments"] or [], 0)))
+        computed.automated_decision = assess_review(
+            findings=computed.findings,
+            stages=computed.stages,
+            extraction_status=sv["extraction_status"],
+            evidence_assessments=[result[1] for result in evidence_results],
+        )
     except Exception as e:  # essential stage failed: nothing partial is persisted
         run_id = record_failed_run(m.workspace_id, version_id, m.user.id, f"{type(e).__name__}")
         raise HTTPException(500, f"The review failed and was recorded as failed (run {run_id}). No findings were saved.")
     run_id = persist_review(conn, workspace_id=m.workspace_id, sv=sv, user_id=m.user.id, c=computed)
-    for item in evidence:
-        assessment, explanation, excerpt = _assess_evidence(sv["extracted_text"] or "", item["extracted_text"] or "")
-        location = locate(item["segments"] or [], 0)
+    for item, assessment, explanation, excerpt, location in evidence_results:
         ex(conn, """insert into evidence_assessments
                     (workspace_id, submission_version_id, evidence_id, review_run_id, assessment, explanation, excerpt, location)
                     values (:w,:v,:e,:r,:a,:x,:q,cast(:loc as jsonb))""",
@@ -116,8 +164,12 @@ def get_run(run_id: UUID, m: Member = Depends(member_of()), conn: Connection = D
                                     a.assessment, a.explanation, a.excerpt, a.location, a.created_at
                              from evidence_assessments a join submission_evidence e on e.id = a.evidence_id
                              where a.review_run_id = :r order by a.created_at""", r=run_id)
+    automated_decision = q1(conn, """select outcome, risk_score, rationale, factors, policy_version, created_at
+                                      from automated_decisions where review_run_id = :r""", r=run_id)
+    visual_analysis = q1(conn, """select status, results, created_at from visual_analyses where review_run_id=:r""", r=run_id)
     return {**run, "findings": findings, "fact_versions_used": facts, "rule_versions_used": rules,
-            "evidence_assessments": assessments}
+            "evidence_assessments": assessments, "automated_decision": automated_decision,
+            "visual_analysis": visual_analysis}
 
 
 @router.get("/findings/{finding_id}")
@@ -136,7 +188,8 @@ def get_finding(finding_id: UUID, m: Member = Depends(member_of()), conn: Connec
                                  fv.version_no fact_version_no, fv.name fact_name, fv.approved_value, fv.id fact_version_id,
                                  rv.version_no rule_version_no, rv.rule_type, rv.description rule_description, rv.id rule_version_id,
                                  sr.id source_id, sr.title source_title, sr.url source_url, sr.publisher, sr.retrieved_at,
-                                 sr.published_at, sr.access_status
+                                 sr.published_at, sr.access_status, sr.search_query, sr.extraction_status,
+                                 sr.product_research_source_id
                           from finding_evidence e
                           left join brand_fact_versions fv on fv.id = e.fact_version_id
                           left join brand_rule_versions rv on rv.id = e.rule_version_id
@@ -196,6 +249,11 @@ def record_decision(version_id: UUID, body: DecisionIn, m: Member = Depends(memb
     if not run or run["status"] == "failed":
         raise HTTPException(422, "review_run_id must be a completed review run of this exact version")
     if body.decision == "approved":
+        automated = q1(conn, "select outcome from automated_decisions where review_run_id = :r and submission_version_id = :v",
+                       r=run["id"], v=version_id)
+        if not automated or automated["outcome"] != "approved":
+            outcome = automated["outcome"] if automated else "unavailable"
+            raise HTTPException(409, f"Approval is blocked by the automated governance decision ({outcome}). Re-run analysis after addressing its findings.")
         gate = q1(conn, """select count(*) total,
                                   count(*) filter (where e.extraction_status in ('complete','partial')) processed,
                                   count(a.id) assessments

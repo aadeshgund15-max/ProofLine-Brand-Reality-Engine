@@ -1,30 +1,27 @@
-# Proofline — backend (Round 2)
+# Proofline — backend and local development (Round 3 work in progress)
 
 Brand-governance API: approved brand facts and rules with immutable versions, content review with
 evidence-linked findings, human decisions, an audit trail, and the **Brand Time Machine** (changing
 an approved fact/rule flags only the content that recorded a dependency on it).
 
-**Scope of this delivery: the backend and database only.** `frontend/` contains just a project
-scaffold and a typed API client (`src/api.ts`); there are no pages. Do not treat it as a UI.
+The repository includes a React/Vite workspace and a FastAPI/PostgreSQL backend. Round 3 functionality
+is still in progress; see the verification status and limitations below before presenting it as complete.
 
 ## What was verified, and how
 
 | Area | Status |
 |---|---|
-| Rule/fact checks, extraction (DOCX, PDF, PPTX, image OCR, HTML), SSRF guard, impact resolution, verification logic | **Unit-tested**, 70 tests passing |
-| Full SQL layer on PostgreSQL 16: migration, versioning, review persistence, dependencies, impact queue, decisions, audit, immutability triggers, workspace isolation, roles, every file format through the real route + DB, URL ingestion, provider-failure paths | **18 database-backed tests passing** (see caveat 1) |
-| Supabase RLS policies (`0002`) | Tested for read isolation and denied writes against a **stand-in** `auth.uid()`/`authenticated` role — not a real Supabase project |
-| HTTP layer (FastAPI routing, `Depends`, JWT verification, multipart, Supabase JWKS/Storage calls, the real socket fetch transport, Tavily/Brave/LLM HTTP calls) | **Written, not executed.** FastAPI, SQLAlchemy, psycopg and httpx could not be installed where this was built |
+| Backend unit tests | **112 passed; 3 skipped** (two database-backed tests need `PROOFLINE_TEST_PSQL`; OCR integration needs the Tesseract executable) |
+| Frontend typecheck, lint, tests, production build | **Passed locally; 4 frontend unit tests** |
+| Migration 0003 plain-Postgres compatibility | Supabase-only RLS setup is capability-guarded; **not executed against a database in this environment** |
+| SQL integration, migrations 0001–0009, Supabase RLS, workspace isolation against a real database | **Not verified in this pass**; the configured project could not be identified as the disposable development project |
+| Live Tavily/Brave/LLM connectivity and end-to-end product research | **Not verified**; provider configuration is missing |
 
 Caveats you should know about:
-1. The database tests call the real route functions and run the real SQL against a real Postgres, but through a test-only
-   `psql` adapter (`tests/pg_harness.py`) and with throwaway stubs standing in for FastAPI/SQLAlchemy. Your first run with the
-   real packages may surface integration errors (dependency injection, driver parameter adaptation, transaction handling).
-2. PDF tests ran on the `pypdf` fallback; the preferred PyMuPDF path is untested.
-3. OCR was tested with Tesseract 5.3 on generated images only. Real posters will vary; the app reports confidence and never marks
-   weak OCR as complete.
-4. No LLM or search provider was ever called live. Their parsing/validation is tested with fakes only.
-5. Nothing has been deployed or load-tested.
+1. Database-backed tests truncate test tables and must only use a separately created disposable database. No database-writing test was run here.
+2. Image OCR requires the system Tesseract executable; this environment does not have it, so the OCR-specific test is skipped and uploaded images report extraction failure when OCR cannot run.
+3. No search or LLM provider was called live. Provider adapters are present, but current environment variables do not configure them.
+4. No Round 3 migrations were applied and nothing was deployed or load-tested.
 
 ## Run it
 
@@ -41,7 +38,7 @@ DATABASE_URL=postgresql://... ./scripts/migrate.sh --supabase   # Supabase: also
 DATABASE_URL=postgresql://... ./scripts/migrate.sh              # plain Postgres: skips 0002
 ```
 
-**API**: `uvicorn app.main:app --reload --port 8000`  (health: `GET /api/health`)
+**API**: `uvicorn app.main:app --reload --port 8000` (`GET /api/health` is liveness; `GET /api/health/ready` performs a read-only database readiness check)
 
 **Auth modes**
 - `AUTH_MODE=supabase`: the client signs in with Supabase Auth and sends its access token as `Authorization: Bearer`. Set
@@ -55,7 +52,7 @@ python -m unittest discover -s tests -t .              # unit tests (database te
 PROOFLINE_TEST_PSQL="host=/tmp port=5432 user=postgres dbname=proofline_test" python -m unittest discover -s tests -t .   # + database tests
 ```
 These were run with `unittest`. The files are plain `unittest` classes, so `pytest` should also collect them, but that was not run.
-Create the test database first and apply `0001_init.sql` to it. The database tests truncate its tables. Never point them at real data.
+Create a disposable test database first and apply the plain-Postgres migrations to it with `DATABASE_URL=<test-db> ./scripts/migrate.sh` from `backend/`. The database tests truncate tables. Never point them at a real or production database.
 
 ## Security model
 - Every workspace route depends on `member_of(roles)`, which checks membership in the database per request; non-members get 404.
@@ -98,8 +95,37 @@ listed term (a known wrong variant) are flagged.
   reported as empty, not OCR'd. JavaScript-rendered pages are not executed.
 - Review runs synchronously inside the request (provider calls hold a database connection). Move to a job queue before heavy use.
 - Rate limiting is an in-memory per-process counter on review runs only.
-- Round 3 items (visual brand checks, continuous monitoring, multi-source risk scoring) are not implemented; the schema keeps
-  source records, snapshots, hashes and dependency links so they can be added.
+- Round 3 is partially implemented. The current policy records deterministic risk and automated outcomes. Incomplete mandatory
+  visual or proof-provenance stages produce `on_hold`; approved high-severity rule violations produce `rejected`. Search-provider
+  excerpts are never enough to produce `approved`. Full source reliability and the remaining visual checks are still required,
+  so automatic approval is not reachable in the current product flow.
+- Phase 2 adds a private owner-managed image reference library, versioned palettes, and CIE76 dominant-color screening for image
+  submissions. Logo matching, typography, layout, PDF-page, and slide checks remain unavailable; image results therefore stay
+  partial and cannot authorize approval.
+- Phase 3 adds workspace-scoped public URL registration, SSRF-safe text snapshots, change alerts, retry/backoff logs, and a
+  background worker. Run a separate process from `backend/`: `python -m app.services.monitor_worker --poll-seconds 30`.
+  Changed pages receive a deterministic/optional-provider re-review report, which remains on hold until mandatory proof and visual
+  stages are available. Monitoring covers readable HTML and plain text; it does not render JavaScript or inspect page images.
+- Product Intelligence adds a workspace-scoped product registry and a background research queue. Each run executes twelve
+  category-focused queries through the configured Tavily or Brave provider, stores the query-to-source relationships, retrieves
+  public pages through the SSRF-safe fetcher, detects duplicate content, and reuses successful page fetches for 24 hours. The
+  profile records the user-supplied identity and source coverage; it does not synthesize verified specifications from raw pages.
+  During submission review, readable pages from the latest research run are checked against each detected claim only when an
+  exact model identifier or supplied official domain matched. Exact source passages and product research source IDs are saved in
+  finding evidence. This is model-assisted triage, not independent proof. Domain classifications are candidates only. Source
+  Source records now include versioned, explainable triage signals for authority candidates, independence, freshness, directness,
+  methodology indicators, possible disclosures, and duplicate content. These rules do not verify source authority, certify a
+  product, establish corroboration, or replace human review. Product identity must be confirmed by a user and a
+  matching identifier or supplied official domain must appear in an inspected source for the research gate to complete.
+  Run the worker from `backend/`: `python -m app.services.product_research_worker --poll-seconds 20`.
+
+Search results are now followed by an SSRF-safe fetch and text extraction of each public page. Only passages verified within
+that fetched text are classified as support or contradiction; a result snippet alone is stored as an access limitation and
+requires human review. The source signal record is triage metadata; claim-level source reliability and corroboration remain
+human-review responsibilities.
+
+Apply migrations `0004_automated_decisions.sql` through `0009_source_quality_assessments.sql` before
+using these endpoints. The app does not apply schema changes automatically.
 
 ---
 

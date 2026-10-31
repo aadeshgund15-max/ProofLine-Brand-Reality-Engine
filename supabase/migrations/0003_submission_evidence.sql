@@ -34,13 +34,21 @@ create table evidence_assessments (
 create index evidence_assessments_run_idx on evidence_assessments(review_run_id);
 create index evidence_assessments_version_idx on evidence_assessments(submission_version_id);
 
-alter table submission_evidence enable row level security;
-alter table evidence_assessments enable row level security;
+-- RLS policies depend on Supabase's authenticated role and the helper established by
+-- 0002_rls_supabase.sql. Keep the evidence tables usable on plain PostgreSQL too.
+do $$
+begin
+  if to_regrole('authenticated') is not null
+     and to_regprocedure('public.is_workspace_member(uuid)') is not null then
+    alter table submission_evidence enable row level security;
+    alter table evidence_assessments enable row level security;
 
-create policy submission_evidence_member_select on submission_evidence
-  for select to authenticated using (public.is_workspace_member(workspace_id));
-create policy evidence_assessments_member_select on evidence_assessments
-  for select to authenticated using (public.is_workspace_member(workspace_id));
+    create policy submission_evidence_member_select on submission_evidence
+      for select to authenticated using (public.is_workspace_member(workspace_id));
+    create policy evidence_assessments_member_select on evidence_assessments
+      for select to authenticated using (public.is_workspace_member(workspace_id));
+  end if;
+end $$;
 
 create trigger submission_evidence_immutable before update or delete on submission_evidence
   for each row execute function proofline_block_mutation();

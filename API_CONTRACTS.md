@@ -10,6 +10,9 @@ The frontend talks to the FastAPI service under `/api` (local Vite proxy: port 8
 - Submissions: multipart `POST /api/workspaces/{w}/submissions` and `/submissions/{id}/versions`; `GET /submissions`, `/submissions/{id}`, `/submission-versions/{id}`.
 - Evidence: multipart `POST /api/workspaces/{w}/submission-versions/{v}/evidence` for private TXT/PDF/DOCX proof files; `GET /submission-versions/{v}/evidence` returns extraction status, warnings, segments, and extracted text.
 - Reviews: `POST /submission-versions/{id}/review`, `GET /review-runs/{id}`, `GET /findings/{id}`, `PATCH /findings/{id}/status`, and `POST /submission-versions/{id}/decisions`.
+- Reports: `GET /api/workspaces/{w}/submissions/{id}/report.pdf` downloads a workspace-authorized PDF assembled from persisted review, evidence, product-research, visual-analysis, and decision records. Missing records are labeled as unavailable; the report does not infer them.
+- Health: `GET /api/health` is process liveness; `GET /api/health/ready` performs a read-only `SELECT 1` database probe without returning database identity.
+- Product Intelligence: `/api/workspaces/{w}/product-intelligence/products` creates and lists product profiles; `POST .../products/{id}/research` queues a research run; `GET .../products/{id}` returns saved queries, sources, profile facts, and linked claim findings. Product sources include versioned, explainable `source_assessment` signals. These signals are triage metadata and do not establish truth, source authority, certification, or independent verification. Persisting them requires migration `0009_source_quality_assessments.sql`.
 - Impact/audit: `GET /impacts`, `GET /impacts/{id}`, and `GET /audit`.
 
 The API enforces authorization per workspace and role. The frontend does not persist application records locally or fabricate records after API errors.

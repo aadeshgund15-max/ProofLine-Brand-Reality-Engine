@@ -1,4 +1,5 @@
 import pathlib
+import shutil
 import unittest
 
 from app.core.checks import run_checks, FactV
@@ -80,6 +81,7 @@ class PptxTests(unittest.TestCase):
 
 
 class ImageTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("tesseract"), "Tesseract OCR executable is not installed")
     def test_poster_ocr(self):
         r = extract_image(read("poster.png"))
         self.assertIn(r.status, ("complete", "partial"))

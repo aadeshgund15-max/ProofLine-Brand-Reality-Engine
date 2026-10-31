@@ -314,6 +314,23 @@ def extract_image(data: bytes, ocr_lang: str = "eng", min_confidence: float = 70
         img.load()
     except Exception as e:
         return _failed("image", f"The image could not be opened ({type(e).__name__}).")
+    # A truly flat image has no text to recover. Detect this before invoking the
+    # external OCR binary so blank uploads are reported accurately even when OCR
+    # is not installed. A small tolerance handles minor encoding noise.
+    try:
+        from PIL import ImageStat
+        thumbnail = img.convert("RGB")
+        thumbnail.thumbnail((256, 256))
+        if max(ImageStat.Stat(thumbnail).stddev, default=0.0) <= 0.5:
+            return ExtractionResult(
+                "image", "empty", "", [],
+                ["No visible text or meaningful image variation was found."],
+                {"image_size": list(img.size), "ocr_performed": False},
+            )
+    except Exception:
+        # If the inexpensive blank check is unavailable, continue through OCR;
+        # do not turn an analysis error into a successful empty result.
+        pass
     try:
         import pytesseract
         d = pytesseract.image_to_data(img.convert("RGB"), lang=ocr_lang, output_type=pytesseract.Output.DICT,

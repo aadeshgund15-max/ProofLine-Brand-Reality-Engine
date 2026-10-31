@@ -1,4 +1,4 @@
-import type { ApiErrorBody, AuditEvent, BrandSource, DashboardSummary, Decision, Finding, Impact, Member, Profile, ReviewFinding, ReviewResult, Session, SourceVersion, SubmissionDetail, SubmissionEvidence, Workspace } from './contracts/index'
+import type { ApiErrorBody, AuditEvent, AutomatedDecision, BrandSource, DashboardSummary, Decision, Finding, Impact, Member, MonitoringChange, MonitoredSource, PaletteVersion, Profile, ProductClaim, ProductClaimCoverage, ProductCoverage, ProductFact, ProductRecord, ProductSource, ReviewFinding, ReviewResult, RiskQueueItem, Session, SourceVersion, SubmissionDetail, SubmissionEvidence, VisualAnalysis, VisualAsset, Workspace } from './contracts/index'
 import { requireSupabase, supabase } from './supabase'
 
 const apiBase = (import.meta.env.VITE_API_BASE ?? '').trim().replace(/\/$/, '')
@@ -42,6 +42,20 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   if (response.status === 204) return undefined as T
   return data as T
 }
+async function requestBlob(path: string): Promise<Blob> {
+  const { data: { session: authSession } } = await supabase?.auth.getSession() ?? { data: { session: null } }
+  const headers = new Headers()
+  if (authSession?.access_token) headers.set('Authorization', `Bearer ${authSession.access_token}`)
+  const response = await fetch(`${apiBase}/api${path}`, { headers })
+  if (!response.ok) {
+    if (response.status === 401 && authSession) {
+      session.clear()
+      window.dispatchEvent(new Event('proofline:session-expired'))
+    }
+    throw new ApiError(`Download request failed (${response.status}).`, response.status)
+  }
+  return response.blob()
+}
 const get = <T,>(path: string) => request<T>(path)
 const post = <T,>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body ?? {} })
 const put = <T,>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body })
@@ -50,9 +64,9 @@ const patch = <T,>(path: string, body: unknown) => request<T>(path, { method: 'P
 interface RawWorkspace { id: string; name: string; role: Workspace['role']; created_at: string }
 interface RawFactVersion { id: string; version_no: number; name: string; approved_value: string; value_type: string; subject_terms: string[]; status: string; created_at: string; created_by: string | null; is_current?: boolean }
 interface RawFact { id: string; key: string; brand_profile_id: string; version_id: string; version_no: number; name: string; approved_value: string; value_type: string; subject_terms: string[]; status: string; change_note?: string | null; versions?: RawFactVersion[] }
-interface RawSubmission { id: string; title: string; created_at: string; current_version_id: string; brand_profile_id: string; versions: Array<{ id: string; version_no: number; created_at: string }>; review_runs: Array<{ id: string; submission_version_id: string; status: string; started_at: string }>; decisions: Array<{ id: string; submission_version_id: string; review_run_id: string; decision: string; comment: string | null; decided_at: string; decided_by: string | null }> }
+interface RawSubmission { id: string; title: string; created_at: string; current_version_id: string; brand_profile_id: string; versions: Array<{ id: string; version_no: number; created_at: string }>; review_runs: Array<{ id: string; submission_version_id: string; status: string; started_at: string; automated_outcome?: string | null; automated_risk_score?: number | null }>; decisions: Array<{ id: string; submission_version_id: string; review_run_id: string; decision: string; comment: string | null; decided_at: string; decided_by: string | null }> }
 interface RawFinding { id: string; category: string; title: string; explanation: string; severity: Finding['severity']; excerpt: string | null; span_start: number | null; span_end: number | null; verification_status: string; status: string }
-interface RawRun { id: string; submission_version_id: string; status: string; engine_version: string; started_at: string; findings: RawFinding[] }
+interface RawRun { id: string; submission_version_id: string; status: string; engine_version: string; started_at: string; findings: RawFinding[]; automated_decision?: AutomatedDecision | null; visual_analysis?: VisualAnalysis | null }
 
 const roleFrom = (role: string): Workspace['role'] => role === 'owner' || role === 'reviewer' ? role : 'editor'
 const toVersion = (v: RawFactVersion, factId: string): SourceVersion => ({ id: v.id, source: factId, no: v.version_no, body: v.approved_value, value: Number(v.approved_value.replace(/[^0-9.-]/g, '')) || 0, value_type: v.value_type, created_by: v.created_by ?? '—', created: v.created_at, approved_by: v.status === 'approved' ? v.created_by ?? 'approved' : null, approved_at: v.status === 'approved' ? v.created_at : null })
@@ -149,8 +163,8 @@ export const rulesApi = {
 }
 export const submissionApi = {
   async list(workspaceId: string) {
-    const rows = await get<Array<RawSubmission & { version_id: string; version_no: number; last_run_status: string | null; last_decision: string | null; open_impacts: number; open_findings: number }>>(`/workspaces/${workspaceId}/submissions`)
-    return rows.map(row => ({ id: row.id, ws: workspaceId, title: row.title, status: row.last_decision === 'approved' || row.last_decision === 'rejected' || row.last_decision === 'changes_requested' ? row.last_decision : row.last_run_status && row.last_run_status !== 'failed' ? 'in_review' as const : 'awaiting_evidence' as const, owner: '—', revision: { id: row.version_id, sub: row.id, no: row.version_no, text: '', hash: '', created: row.created_at } }))
+    const rows = await get<Array<RawSubmission & { version_id: string; version_no: number; last_run_status: string | null; last_decision: string | null; last_automated_outcome: string | null; open_impacts: number; open_findings: number }>>(`/workspaces/${workspaceId}/submissions`)
+    return rows.map(row => ({ id: row.id, ws: workspaceId, title: row.title, status: row.last_decision === 'approved' || row.last_decision === 'rejected' || row.last_decision === 'changes_requested' ? row.last_decision : row.last_automated_outcome === 'approved' ? 'approved' as const : row.last_automated_outcome === 'rejected' ? 'rejected' as const : row.last_automated_outcome === 'on_hold' ? 'on_hold' as const : row.last_run_status && row.last_run_status !== 'failed' ? 'in_review' as const : 'awaiting_evidence' as const, owner: '—', revision: { id: row.version_id, sub: row.id, no: row.version_no, text: '', hash: '', created: row.created_at } }))
   },
   async create(workspaceId: string, title: string, text: string, options: { sourceType?: string; file?: File; url?: string } = {}) {
     const profileId = await ensureBrandProfile(workspaceId)
@@ -163,15 +177,19 @@ export const submissionApi = {
     const currentVersion = await get<{ id: string; submission_id: string; version_no: number; extracted_text: string; content_hash: string; created_at: string }>(`/workspaces/${workspaceId}/submission-versions/${raw.current_version_id}`)
     const run = raw.review_runs.filter(item => item.submission_version_id === raw.current_version_id).sort((a, b) => b.started_at.localeCompare(a.started_at))[0]
     const latestRun = run ? await get<RawRun & { findings: RawFinding[] }>(`/workspaces/${workspaceId}/review-runs/${run.id}`) : null
-    const evidence = await get<SubmissionEvidence[]>(`/workspaces/${workspaceId}/submission-versions/${raw.current_version_id}/evidence`)
+    const [evidence, product_link] = await Promise.all([
+      get<SubmissionEvidence[]>(`/workspaces/${workspaceId}/submission-versions/${raw.current_version_id}/evidence`),
+      get<SubmissionDetail['product_link']>(`/workspaces/${workspaceId}/submission-versions/${raw.current_version_id}/product`),
+    ])
     const findings = latestRun ? await Promise.all(latestRun.findings.map(async finding => {
       const detail = await get<{ evidence: Array<{ excerpt: string | null; source_url: string | null; access_status: string | null }> }>(`/workspaces/${workspaceId}/findings/${finding.id}`)
       return { ...toFinding(finding), evidence: detail.evidence.map(e => ({ snippet: e.excerpt ?? undefined, source_url: e.source_url ?? undefined, status: e.access_status ?? undefined })) }
     })) : null
     const decisions = raw.decisions.map(d => ({ id: d.id, sub: submissionId, rev: d.submission_version_id, reviewer: d.decided_by ?? 'Unknown reviewer', decision: d.decision, rationale: d.comment ?? '', created: d.decided_at }))
     const decision = decisions.find(d => d.rev === raw.current_version_id)
-    const status = decision?.decision === 'approved' || decision?.decision === 'rejected' || decision?.decision === 'changes_requested' ? decision.decision : latestRun && latestRun.status !== 'failed' ? 'in_review' : evidence.length ? 'ready_for_review' : 'awaiting_evidence'
-    return { id: raw.id, ws: workspaceId, title: raw.title, status, owner: '—', revision: { id: currentVersion.id, sub: submissionId, no: currentVersion.version_no, text: currentVersion.extracted_text, hash: currentVersion.content_hash, created: currentVersion.created_at }, findings, decisions, evidence, assessments: (latestRun as (RawRun & { evidence_assessments?: SubmissionDetail['assessments'] }) | null)?.evidence_assessments ?? [] }
+    const automatedOutcome = latestRun?.automated_decision?.outcome
+    const status = decision?.decision === 'approved' || decision?.decision === 'rejected' || decision?.decision === 'changes_requested' ? decision.decision : automatedOutcome === 'approved' ? 'approved' : automatedOutcome === 'rejected' ? 'rejected' : automatedOutcome === 'on_hold' ? 'on_hold' : latestRun && latestRun.status !== 'failed' ? 'in_review' : evidence.length ? 'ready_for_review' : 'awaiting_evidence'
+    return { id: raw.id, ws: workspaceId, title: raw.title, status, owner: '—', revision: { id: currentVersion.id, sub: submissionId, no: currentVersion.version_no, text: currentVersion.extracted_text, hash: currentVersion.content_hash, created: currentVersion.created_at }, findings, decisions, evidence, automated_decision: latestRun?.automated_decision ?? null, visual_analysis: latestRun?.visual_analysis ?? null, assessments: (latestRun as (RawRun & { evidence_assessments?: SubmissionDetail['assessments'] }) | null)?.evidence_assessments ?? [], product_link }
   },
   async revise(workspaceId: string, submissionId: string, text: string) {
     const profileId = await ensureBrandProfile(workspaceId)
@@ -183,13 +201,67 @@ export const submissionApi = {
     if (description?.trim()) form.append('description', description.trim())
     return request<SubmissionEvidence>(`/workspaces/${workspaceId}/submission-versions/${versionId}/evidence`, { method: 'POST', form })
   },
+  linkProduct(workspaceId: string, versionId: string, productId: string) {
+    return post(`/workspaces/${workspaceId}/submission-versions/${versionId}/product?product_id=${encodeURIComponent(productId)}`)
+  },
+  report(workspaceId: string, submissionId: string) {
+    return requestBlob(`/workspaces/${workspaceId}/submissions/${submissionId}/report.pdf`)
+  },
 }
+export const productIntelligenceApi = {
+  status(workspaceId: string) { return get<{ search_provider: string; configured: boolean; message: string }>(`/workspaces/${workspaceId}/product-intelligence/status`) },
+  list(workspaceId: string) { return get<ProductRecord[]>(`/workspaces/${workspaceId}/product-intelligence/products`) },
+  async create(workspaceId: string, input: Omit<ProductRecord, 'id' | 'brand_profile_id' | 'identity_status' | 'identity_confirmed'> & { confirm_identity: boolean }) {
+    const brand_profile_id = await ensureBrandProfile(workspaceId)
+    return post<ProductRecord>(`/workspaces/${workspaceId}/product-intelligence/products`, { ...input, brand_profile_id })
+  },
+  detail(workspaceId: string, id: string) {
+    return get<{ product: ProductRecord; runs: Array<Record<string, unknown>>; latest_run: Record<string, unknown> | null; queries: Array<Record<string, unknown>>; sources: ProductSource[]; profile: { version_no: number; profile: { facts?: ProductFact[]; warnings?: string[]; limitations_note?: string }; coverage: ProductCoverage; created_at: string } | null; claims: ProductClaim[]; claim_coverage: ProductClaimCoverage }>(`/workspaces/${workspaceId}/product-intelligence/products/${id}`)
+  },
+  research(workspaceId: string, id: string) { return post(`/workspaces/${workspaceId}/product-intelligence/products/${id}/research`) },
+}
+export const visualApi = {
+  async library(workspaceId: string) {
+    const profileId = await ensureBrandProfile(workspaceId)
+    const [assets, palettes] = await Promise.all([
+      get<VisualAsset[]>(`/workspaces/${workspaceId}/visual/assets`),
+      get<PaletteVersion[]>(`/workspaces/${workspaceId}/visual/palette?brand_profile_id=${encodeURIComponent(profileId)}`),
+    ])
+    return { profileId, assets, palettes }
+  },
+  async upload(workspaceId: string, profileId: string, name: string, assetType: string, category: string, file: File) {
+    const form = new FormData()
+    form.append('brand_profile_id', profileId); form.append('name', name); form.append('asset_type', assetType)
+    form.append('category', category); form.append('file', file)
+    return request<VisualAsset>(`/workspaces/${workspaceId}/visual/assets`, { method: 'POST', form })
+  },
+  content(workspaceId: string, assetId: string) { return requestBlob(`/workspaces/${workspaceId}/visual/assets/${assetId}/content`) },
+  savePalette(workspaceId: string, profileId: string, colors: string[]) {
+    return post<PaletteVersion>(`/workspaces/${workspaceId}/visual/palette`, { brand_profile_id: profileId, colors })
+  },
+}
+export const monitoringApi = {
+  sources(workspaceId: string) { return get<MonitoredSource[]>(`/workspaces/${workspaceId}/monitoring/sources`) },
+  changes(workspaceId: string) { return get<MonitoringChange[]>(`/workspaces/${workspaceId}/monitoring/changes`) },
+  async create(workspaceId: string, input: { url: string; label: string; interval_minutes: number; product_id?: string }) {
+    const brand_profile_id = await ensureBrandProfile(workspaceId)
+    return post<MonitoredSource>(`/workspaces/${workspaceId}/monitoring/sources`, { ...input, brand_profile_id })
+  },
+  update(workspaceId: string, sourceId: string, input: { url?: string; label?: string; interval_minutes?: number; status?: string }) {
+    return patch<MonitoredSource>(`/workspaces/${workspaceId}/monitoring/sources/${sourceId}`, input)
+  },
+  check(workspaceId: string, sourceId: string) { return post(`/workspaces/${workspaceId}/monitoring/sources/${sourceId}/check`) },
+  updateChange(workspaceId: string, changeId: string, status: 'reviewed' | 'dismissed', reason: string) {
+    return patch(`/workspaces/${workspaceId}/monitoring/changes/${changeId}`, { status, reason })
+  },
+}
+export const riskApi = { list(workspaceId: string) { return get<RiskQueueItem[]>(`/workspaces/${workspaceId}/risk-queue`) } }
 export const reviewApi = {
   async run(workspaceId: string, submissionId: string): Promise<ReviewResult> {
     const detail = await submissionApi.detail(workspaceId, submissionId)
     const run = await post<RawRun & { findings: RawFinding[] }>(`/workspaces/${workspaceId}/submission-versions/${detail.revision.id}/review`)
     const findings: ReviewFinding[] = run.findings.map(finding => ({ category: finding.category, severity: finding.severity, certainty: finding.verification_status, quoted: finding.excerpt ?? '', start: finding.span_start ?? 0, end: finding.span_end ?? 0, explanation: finding.explanation || finding.title, action: 'Review the evidence and context before deciding.', evidence: [], status: finding.status }))
-    return { review_run_id: run.id, revision_id: run.submission_version_id, engine: run.engine_version, findings, dependencies: [], summary: `Review ${run.status.replaceAll('_', ' ')} with ${findings.length} finding${findings.length === 1 ? '' : 's'}.` }
+    return { review_run_id: run.id, revision_id: run.submission_version_id, engine: run.engine_version, findings, dependencies: [], summary: `Automated decision: ${run.automated_decision?.outcome.replaceAll('_', ' ') ?? 'not available'} · risk ${run.automated_decision?.risk_score ?? '—'}/100. ${run.automated_decision?.rationale ?? ''}` }
   },
 }
 export const reviewDecisionApi = {

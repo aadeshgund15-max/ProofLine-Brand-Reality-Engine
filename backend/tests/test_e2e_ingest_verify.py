@@ -195,8 +195,12 @@ class VerificationTests(Base):
 
     def test_real_sources_persisted_and_classified(self):
         s = self.sub("text", text=self.CLAIM)
+        from app.services import review as svc
+        def fetched(url):
+            return ("Acme was founded in 1999 in Pune." if url.endswith("history") else "", "ok", "complete")
         with mock.patch.object(reviews, "get_search_provider", return_value=FakeSearch(self.HITS)), \
-             mock.patch.object(reviews, "get_llm_provider", return_value=FakeLlm()):
+             mock.patch.object(reviews, "get_llm_provider", return_value=FakeLlm()), \
+             mock.patch.object(svc, "fetch_claim_source", side_effect=fetched):
             run = self.review(s["version"]["id"])
         self.assertEqual(run["status"], "completed")
         self.assertEqual(run["stages"]["verification"]["status"], "completed")
@@ -229,7 +233,9 @@ class VerificationTests(Base):
 
     def test_search_without_llm_requires_human_review(self):
         s = self.sub("text", text=self.CLAIM)
-        with mock.patch.object(reviews, "get_search_provider", return_value=FakeSearch(self.HITS)):
+        from app.services import review as svc
+        with mock.patch.object(reviews, "get_search_provider", return_value=FakeSearch(self.HITS)), \
+             mock.patch.object(svc, "fetch_claim_source", side_effect=lambda url: ("Acme was founded in 1999.", "ok", "complete")):
             run = self.review(s["version"]["id"])
         f = next(x for x in run["findings"] if x["origin"] == "verification")
         self.assertEqual(f["verification_status"], "needs_human_review")

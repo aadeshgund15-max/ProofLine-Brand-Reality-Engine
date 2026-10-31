@@ -11,6 +11,7 @@ PyMuPDF>=1.24
 python-pptx>=1.0
 pytesseract>=0.3.10
 Pillow>=10.3
+reportlab>=4,<6
 beautifulsoup4>=4.12
 lxml>=5.2
 slowapi>=0.1.9

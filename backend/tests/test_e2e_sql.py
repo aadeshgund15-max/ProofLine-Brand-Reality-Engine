@@ -4,6 +4,7 @@ Skipped unless PROOFLINE_TEST_PSQL is set (see tests/pg_harness.py). Each `with 
 is one request-scoped transaction, like the API's get_conn dependency.
 """
 import asyncio
+import hashlib
 import unittest
 import uuid
 
@@ -57,9 +58,20 @@ class Scenario(unittest.TestCase):
 
     def submit(self, title, text):
         with PsqlConn() as c:
-            return asyncio.run(submissions.create_submission(
+            result = asyncio.run(submissions.create_submission(
                 brand_profile_id=self.bp, title=title, source_type="text", text=text, url=None, file=None,
                 m=self.m, conn=c))
+            self.attach_test_proof(c, result["version"]["id"], text)
+            return result
+
+    def attach_test_proof(self, conn, version_id, text):
+        data = text.encode("utf-8")
+        conn.execute("""insert into submission_evidence
+            (workspace_id,submission_version_id,original_filename,storage_path,mime_type,size_bytes,content_hash,
+             extracted_text,extraction_status,extraction_warnings,segments,created_by)
+            values (:w,:v,'test-proof.txt',:path,'text/plain',:size,:hash,:text,'complete','[]'::jsonb,'[]'::jsonb,:u)""",
+                      {"w": self.ws, "v": version_id, "path": f"test/{version_id}.txt", "size": len(data),
+                       "hash": hashlib.sha256(data).hexdigest(), "text": text, "u": self.owner.id})
 
     def review(self, version_id):
         with PsqlConn() as c:
@@ -109,12 +121,19 @@ class Scenario(unittest.TestCase):
             rev = asyncio.run(submissions.create_version(
                 a["id"], source_type="text", text="The Acme Pro Phone costs $799. It is a great phone.",
                 url=None, file=None, m=self.m, conn=c))
+            self.attach_test_proof(c, rev["version"]["id"], "The Acme Pro Phone costs $799. It is a great phone.")
         va2 = rev["version"]["id"]
         self.assertEqual(rev["version"]["version_no"], 2)
         run_a2 = self.review(va2)
         self.assertEqual([f for f in run_a2["findings"] if f["category"] == "rule_violation"], [])
+        self.assertEqual(run_a2["automated_decision"]["outcome"], "on_hold")
         with PsqlConn() as c:
-            reviews.record_decision(va2, reviews.DecisionIn(decision="approved", review_run_id=run_a2["id"]), self.m, c)
+            with self.assertRaises(HTTPException) as blocked:
+                reviews.record_decision(va2, reviews.DecisionIn(decision="approved", review_run_id=run_a2["id"]), self.m, c)
+            self.assertEqual(blocked.exception.status_code, 409)
+        with PsqlConn() as c:
+            reviews.record_decision(va2, reviews.DecisionIn(decision="changes_requested", review_run_id=run_a2["id"],
+                                                             comment="Address the automated hold before approval."), self.m, c)
             hist = submissions.get_submission(a["id"], self.m, c)
         self.assertEqual(len(hist["versions"]), 2)
         self.assertEqual(len(hist["decisions"]), 2)
@@ -140,7 +159,8 @@ class Scenario(unittest.TestCase):
 
         # --- deciding on the stale (pre-change) run does NOT clear the flag
         with PsqlConn() as c:
-            r = reviews.record_decision(va2, reviews.DecisionIn(decision="approved", review_run_id=run_a2["id"]), self.m, c)
+            r = reviews.record_decision(va2, reviews.DecisionIn(decision="changes_requested", review_run_id=run_a2["id"],
+                                                                comment="The reviewed version is stale."), self.m, c)
         self.assertEqual((r["impacts_resolved"], r["impacts_still_open"]), (0, 1))
 
         # --- re-review: new run uses fact v2 and now flags $799 as stale; decision then resolves the flag

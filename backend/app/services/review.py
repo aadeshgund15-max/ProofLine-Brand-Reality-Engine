@@ -14,7 +14,9 @@ from sqlalchemy import Connection
 
 from app.audit import audit
 from app.core.checks import ENGINE_VERSION, FactV, RawFinding, RuleV, run_checks
-from app.core.verification import SEMANTIC_ENGINE, run_semantic_review, verify_claims
+from app.core.governance import AutomatedDecision
+from app.core.visual import analyze_palette
+from app.core.verification import SEMANTIC_ENGINE, fetch_claim_source, run_semantic_review, verify_claims
 from app.db import ex, jb, q, q1, transaction
 from app.extract import locate
 from app.providers.base import LlmProvider, ProviderError, SearchProvider
@@ -47,11 +49,15 @@ class Computed:
     rule_versions: list[str] = field(default_factory=list)
     stages: dict = field(default_factory=dict)
     evidence: list[tuple[int, dict]] = field(default_factory=list)  # (finding index, evidence dict)
+    visual_details: dict = field(default_factory=dict)
+    automated_decision: Optional[AutomatedDecision] = None
     status: str = "completed"
 
 
 def compute_review(sv: dict, facts: list[FactV], rules: list[RuleV], search: SearchProvider,
-                   llm: LlmProvider, brand_context: str = "") -> Computed:
+                   llm: LlmProvider, brand_context: str = "", image_bytes: Optional[bytes] = None,
+                   approved_colors: Optional[list[str]] = None,
+                   product_sources: Optional[list[dict]] = None) -> Computed:
     text = sv["extracted_text"]
     c = Computed()
     # Stage A: deterministic (essential: exceptions propagate)
@@ -62,6 +68,25 @@ def compute_review(sv: dict, facts: list[FactV], rules: list[RuleV], search: Sea
     c.stages["deterministic"] = {"status": "completed", "message": f"{len(det.findings)} finding(s) from "
                                  f"{len(c.fact_versions)} fact(s) and {len(c.rule_versions)} rule(s)."}
     warn = False
+    if image_bytes is not None and approved_colors:
+        try:
+            visual = analyze_palette(image_bytes, approved_colors)
+            c.visual_details = visual
+            c.stages["visual"] = {"status": "partial", "message": "Color palette inspected; logo, typography, and layout checks are not implemented.",
+                                   "findings": len(visual["findings"]), "dominant_colors": visual["dominant_colors"]}
+            for vf in visual["findings"]:
+                c.findings.append(RawFinding(
+                    origin="visual", category="unapproved_color", title="Possible unapproved dominant color",
+                    explanation=(f"{vf['color']} covers {vf['coverage']:.0%} of the image and is ΔE {vf['delta_e']} "
+                                 f"from nearest approved color {vf['nearest_approved']}. Photos and rendering effects can explain this difference."),
+                    severity="medium", excerpt=vf["color"], verification_status="needs_human_review"))
+        except ValueError as e:
+            c.visual_details = {"status": "failed", "message": str(e)}
+            c.stages["visual"] = {"status": "failed", "message": "Image palette analysis failed."}
+    else:
+        c.stages["visual"] = {"status": "unavailable", "message": "Visual analysis requires an image upload and an approved palette. Logo, typography, and layout checks are not implemented."}
+    c.stages["proof_provenance"] = {"status": "unavailable", "message": "Uploaded proof provenance and source reliability are not assessed yet."}
+    warn = True
     # Extraction limitations are findings in their own right
     if sv["extraction_status"] != "complete":
         warn = True
@@ -83,7 +108,8 @@ def compute_review(sv: dict, facts: list[FactV], rules: list[RuleV], search: Sea
         warn = True
         c.stages["semantic"] = {"status": "unavailable", "message": "Semantic review skipped: no LLM provider is configured."}
     # Stage C: external verification (optional)
-    results, v_status, v_msg = verify_claims(text, search, llm if llm.configured() else None, brand_context)
+    results, v_status, v_msg = verify_claims(text, search, llm if llm.configured() else None, brand_context,
+                                              source_fetcher=fetch_claim_source, product_sources=product_sources)
     c.stages["verification"] = {"status": v_status, "message": v_msg}
     if v_status not in ("completed",):
         warn = True
@@ -111,9 +137,13 @@ def compute_review(sv: dict, facts: list[FactV], rules: list[RuleV], search: Sea
             origin="verification", category=category, title=title, explanation=expl, severity=sev,
             span_start=r.claim.start, span_end=r.claim.end, excerpt=r.claim.text, verification_status=r.status))
         for e in r.evidence:
+            if e.access_status == "ok" and e.stance in ("irrelevant", "unclear"):
+                continue
             c.evidence.append((idx, {"title": e.title, "url": e.url, "publisher": e.publisher,
                                      "published_at": e.published_at, "excerpt": e.quote or e.excerpt[:500],
-                                     "stance": e.stance}))
+                                     "stance": e.stance, "search_query": e.search_query,
+                                     "access_status": e.access_status, "extraction_status": e.extraction_status,
+                                     "product_research_source_id": e.product_research_source_id}))
     c.status = "completed_with_warnings" if warn else "completed"
     return c
 
@@ -153,11 +183,13 @@ def persist_review(conn: Connection, *, workspace_id: UUID, sv: dict, user_id: U
                ws=workspace_id, f=row["id"], v=UUID(f.rule_version_id), ex=f.excerpt)
     for idx, ev in c.evidence:
         src = q1(conn, """insert into source_records (workspace_id, kind, title, url, publisher, retrieved_at, published_at,
-                            content_hash, access_status, excerpt, created_by)
+                            content_hash, access_status, excerpt, search_query, extraction_status, created_by,
+                            product_research_source_id)
                           values (:ws, 'external_retrieval', :t, :u, :p, now(), cast(:pub as timestamptz),
-                                  encode(digest(:ex, 'sha256'), 'hex'), 'ok', :ex, :uid) returning id""",
+                                  encode(digest(:ex, 'sha256'), 'hex'), :access, :ex, :query, :extract, :uid, :product_source) returning id""",
                  ws=workspace_id, t=ev["title"][:300], u=ev["url"], p=ev["publisher"], pub=_safe_ts(ev["published_at"]),
-                 ex=ev["excerpt"], uid=user_id)
+                 access=ev["access_status"], ex=ev["excerpt"], query=ev["search_query"], extract=ev["extraction_status"], uid=user_id,
+                 product_source=UUID(ev["product_research_source_id"]) if ev.get("product_research_source_id") else None)
         ex(conn, """insert into finding_evidence (workspace_id, finding_id, kind, source_record_id, stance, excerpt)
                     values (:ws, :f, 'external_source', :s, :st, :ex)""",
            ws=workspace_id, f=ids[idx], s=src["id"], st=ev["stance"], ex=ev["excerpt"])
@@ -179,7 +211,21 @@ def persist_review(conn: Connection, *, workspace_id: UUID, sv: dict, user_id: U
     audit(conn, workspace_id, user_id, "review.completed", "review_run", run_id,
           f"Review run {c.status} with {len(c.findings)} finding(s)",
           {"submission_version_id": str(sv["id"]), "stages": {k: v["status"] for k, v in c.stages.items()},
-           "fact_versions": c.fact_versions, "rule_versions": c.rule_versions})
+           "fact_versions": c.fact_versions, "rule_versions": c.rule_versions,
+           "automated_outcome": c.automated_decision.outcome if c.automated_decision else "unavailable",
+           "risk_score": c.automated_decision.risk_score if c.automated_decision else None})
+    if c.automated_decision is None:
+        raise RuntimeError("Review has no automated governance assessment")
+    ex(conn, """insert into automated_decisions
+                (workspace_id, submission_version_id, review_run_id, outcome, risk_score, rationale, factors, policy_version)
+                values (:ws, :sv, :run, :outcome, :score, :rationale, cast(:factors as jsonb), :policy)""",
+       ws=workspace_id, sv=sv["id"], run=run_id, outcome=c.automated_decision.outcome,
+       score=c.automated_decision.risk_score, rationale=c.automated_decision.rationale,
+       factors=jb(c.automated_decision.factors), policy=c.automated_decision.policy_version)
+    visual_status = c.stages.get("visual", {}).get("status", "unavailable")
+    ex(conn, """insert into visual_analyses(workspace_id, submission_version_id, review_run_id, status, results)
+                values (:ws,:sv,:run,:st,cast(:results as jsonb))""",
+       ws=workspace_id, sv=sv["id"], run=run_id, st=visual_status, results=jb(c.visual_details or c.stages.get("visual", {})))
     return run_id
 
 

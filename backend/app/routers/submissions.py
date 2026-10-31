@@ -203,6 +203,8 @@ select s.id, s.title, s.created_at, s.brand_profile_id, sv.id version_id, sv.ver
        (select r.status from review_runs r where r.submission_version_id = sv.id order by r.started_at desc limit 1) last_run_status,
        (select r.id from review_runs r where r.submission_version_id = sv.id order by r.started_at desc limit 1) last_run_id,
        (select d.decision from review_decisions d where d.submission_version_id = sv.id order by d.decided_at desc limit 1) last_decision,
+       (select d.outcome from automated_decisions d where d.submission_version_id = sv.id order by d.created_at desc limit 1) last_automated_outcome,
+       (select d.risk_score from automated_decisions d where d.submission_version_id = sv.id order by d.created_at desc limit 1) last_automated_risk_score,
        (select count(*) from impact_records i where i.submission_id = s.id and i.status = 'review_required') open_impacts,
        (select count(*) from findings f join review_runs r on r.id = f.review_run_id
           where f.submission_version_id = sv.id and f.status = 'open'
@@ -227,7 +229,9 @@ def get_submission(submission_id: UUID, m: Member = Depends(member_of()), conn: 
                           from submission_versions sv left join app_users u on u.id = sv.created_by
                           where sv.submission_id = :s order by sv.version_no desc""", s=submission_id)
     runs = q(conn, """select r.id, r.submission_version_id, r.status, r.stages, r.started_at, r.completed_at, r.engine_version,
-                             (select count(*) from findings f where f.review_run_id = r.id) finding_count
+                             (select count(*) from findings f where f.review_run_id = r.id) finding_count,
+                             (select d.outcome from automated_decisions d where d.review_run_id = r.id) automated_outcome,
+                             (select d.risk_score from automated_decisions d where d.review_run_id = r.id) automated_risk_score
                       from review_runs r join submission_versions sv on sv.id = r.submission_version_id
                       where sv.submission_id = :s order by r.started_at desc""", s=submission_id)
     decisions = q(conn, """select d.id, d.submission_version_id, d.review_run_id, d.decision, d.comment, d.decided_at, u.email decided_by
