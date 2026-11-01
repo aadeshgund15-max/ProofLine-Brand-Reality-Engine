@@ -50,8 +50,10 @@ class ProductResearchUnitTests(unittest.TestCase):
 
     def test_coverage_is_only_derived_from_recorded_queries_and_sources(self):
         rows = [("official_specs", "completed", 2), ("manuals", "failed", 0)]
-        sources = [{"access_status": "ok", "extraction_status": "complete"},
-                   {"access_status": "unreachable", "extraction_status": "fetch_failed"}]
+        sources = [{"access_status": "ok", "extraction_status": "complete",
+                    "product_match_status": "matched_by_identifier", "query_categories": ["official_specs"]},
+                   {"access_status": "unreachable", "extraction_status": "fetch_failed",
+                    "product_match_status": "ambiguous", "query_categories": ["manuals"]}]
         coverage = _coverage(rows, sources, ["official_specs", "manuals"], "2026-10-31T00:00:00+00:00")
         self.assertEqual(coverage["queries_executed"], 2)
         self.assertEqual(coverage["queries_failed"], 1)
@@ -60,6 +62,9 @@ class ProductResearchUnitTests(unittest.TestCase):
         self.assertEqual(coverage["sources_inaccessible"], 1)
         self.assertEqual(coverage["independent_sources_assessed"], 0)
         self.assertEqual(coverage["categories_with_insufficient_information"], ["manuals"])
+        self.assertEqual(coverage["categories_with_search_results"], ["official_specs"])
+        self.assertEqual(coverage["categories_with_accessible_sources"], ["official_specs"])
+        self.assertEqual(coverage["categories_with_product_matched_sources"], ["official_specs"])
 
     def test_submission_gate_holds_unconfirmed_or_unresearched_products(self):
         self.assertEqual(review_gate(None)[0], "unavailable")

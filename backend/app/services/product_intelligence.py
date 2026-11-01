@@ -158,18 +158,33 @@ def _extract_profile_facts(product: dict, sources: list[dict], llm: LlmProvider)
 
 
 def _coverage(query_rows: list[tuple[str, str, int]], sources: list[dict], expected: list[str], researched_at: str) -> dict:
-    accessible = sum(s["access_status"] == "ok" and s["extraction_status"] not in ("empty", "failed", "unsupported")
-                     for s in sources)
-    covered = sorted({category for category, status, result_count in query_rows if status == "completed" and result_count > 0})
+    readable_sources = [s for s in sources if s["access_status"] == "ok"
+                        and s["extraction_status"] not in ("empty", "failed", "unsupported")]
+    matched_sources = [s for s in readable_sources if s.get("product_match_status") == "matched_by_identifier"]
+    accessible = len(readable_sources)
+    investigated = sorted({category for category, _, _ in query_rows})
+    with_results = sorted({category for category, status, result_count in query_rows
+                           if status == "completed" and result_count > 0})
+    accessible_categories = sorted({category for source in readable_sources
+                                    for category in source.get("query_categories", [])})
+    matched_categories = sorted({category for source in matched_sources
+                                 for category in source.get("query_categories", [])})
     return {"queries_executed": len(query_rows), "queries_failed": sum(status == "failed" for _, status, _ in query_rows),
             "search_results_discovered": sum(count for _, _, count in query_rows), "unique_sources": len(sources),
             "sources_inspected": accessible, "sources_inaccessible": len(sources) - accessible,
             "cached_sources_used": sum(bool(s.get("cached")) for s in sources),
             "supporting_sources": 0, "contradicting_sources": 0, "claims_evaluated": 0,
-            "claims_inconclusive": 0, "categories_covered": covered,
-            "categories_with_insufficient_information": [c for c in expected if c not in covered],
+            "claims_inconclusive": 0, "categories_investigated": investigated,
+            "categories_with_search_results": with_results,
+            "categories_with_accessible_sources": accessible_categories,
+            "categories_with_product_matched_sources": matched_categories,
+            "categories_with_source_bound_observations": [],
+            "categories_with_conflicting_observations": [],
+            "categories_not_investigated": [c for c in expected if c not in investigated],
+            "categories_with_insufficient_information": [c for c in expected if c not in matched_categories],
+            "categories_covered": matched_categories,
             "latest_research_at": researched_at, "independent_sources_assessed": 0,
-            "note": "Counts reflect saved query and source records. No source reliability, independence, or claim assessment is inferred."}
+            "note": "Coverage distinguishes recorded searches, accessible pages, product-matched sources, and source-bound observations. Search results alone are not product evidence."}
 
 
 def review_gate(product: dict | None) -> tuple[str, str]:
@@ -238,6 +253,7 @@ def run_research(research_run_id, search: SearchProvider | None = None, source_f
             item = discovered.get(key)
             if item:
                 item["query_ids"].append(query_id)
+                item["query_categories"].append(category)
                 continue
             if len(discovered) >= MAX_SOURCES_PER_RUN:
                 continue
@@ -249,7 +265,7 @@ def run_research(research_run_id, search: SearchProvider | None = None, source_f
                 text, access, extraction = source_fetcher(hit.url)
             host = urlsplit(hit.url).hostname or ""
             item = {"hit": hit, "category": _source_category(hit.url, category, product.get("official_website")),
-                    "query_ids": [query_id], "text": text[:50_000], "access": access, "extraction": extraction,
+                    "query_ids": [query_id], "query_categories": [category], "text": text[:50_000], "access": access, "extraction": extraction,
                     "match": _product_match_status(product, text, hit.url), "cached": cached}
             discovered[key] = item
 
@@ -307,7 +323,7 @@ def run_research(research_run_id, search: SearchProvider | None = None, source_f
                             "access_status": item["access"], "extraction_status": item["extraction"],
                             "content_hash": content_hash, "duplicate": bool(duplicate), "cached": bool(item["cached"]),
                             "product_match_status": item["match"], "source_assessment": source_assessment,
-                            "query_ids": item["query_ids"]}
+                            "query_ids": item["query_ids"], "query_categories": item["query_categories"]}
         source_rows.append(source_result)
         if text and item["access"] == "ok" and item["extraction"] not in ("empty", "failed", "unsupported"):
             profile_sources.append({**source_result, "text": text})
@@ -319,8 +335,15 @@ def run_research(research_run_id, search: SearchProvider | None = None, source_f
     coverage["product_facts_supported"] = len(profile_facts)
     coverage["profile_extraction_status"] = profile_status
     coverage["profile_extraction_note"] = profile_message
+    source_categories = {str(source["id"]): source.get("query_categories", []) for source in source_rows}
+    coverage["categories_with_source_bound_observations"] = sorted({
+        category for fact in profile_facts for category in source_categories.get(str(fact.get("source_id")), [])
+    })
+    coverage["categories_with_conflicting_observations"] = sorted({
+        fact["category"] for fact in profile_facts if fact["category"] == "conflicting_information"
+    })
     accessible, inaccessible = coverage["sources_inspected"], coverage["sources_inaccessible"]
-    covered = coverage["categories_covered"]
+    covered = coverage["categories_with_product_matched_sources"]
     identity_ready = product["identity_status"] == "confirmed"
     matched_sources = sum(source["product_match_status"] == "matched_by_identifier"
                           and source["access_status"] == "ok"
