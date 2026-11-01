@@ -11,7 +11,7 @@ is still in progress; see the verification status and limitations below before p
 
 | Area | Status |
 |---|---|
-| Backend unit tests | **112 passed; 3 skipped** (two database-backed tests need `PROOFLINE_TEST_PSQL`; OCR integration needs the Tesseract executable) |
+| Backend unit tests | **116 passed; 3 skipped** (two database-backed tests require an explicitly acknowledged disposable database; OCR integration needs the Tesseract executable) |
 | Frontend typecheck, lint, tests, production build | **Passed locally; 4 frontend unit tests** |
 | Migration 0003 plain-Postgres compatibility | Supabase-only RLS setup is capability-guarded; **not executed against a database in this environment** |
 | SQL integration, migrations 0001–0009, Supabase RLS, workspace isolation against a real database | **Not verified in this pass**; the configured project could not be identified as the disposable development project |
@@ -22,6 +22,7 @@ Caveats you should know about:
 2. Image OCR requires the system Tesseract executable; this environment does not have it, so the OCR-specific test is skipped and uploaded images report extraction failure when OCR cannot run.
 3. No search or LLM provider was called live. Provider adapters are present, but current environment variables do not configure them.
 4. No Round 3 migrations were applied and nothing was deployed or load-tested.
+5. [DEVELOPMENT_BACKUP.md](DEVELOPMENT_BACKUP.md) documents a development backup and isolated restore-check procedure for PostgreSQL and private Supabase Storage. The required export/restore tools were unavailable here, so no backup was created or restore verified.
 
 ## Run it
 
@@ -49,9 +50,12 @@ DATABASE_URL=postgresql://... ./scripts/migrate.sh              # plain Postgres
 **Tests**
 ```bash
 python -m unittest discover -s tests -t .              # unit tests (database tests skip themselves)
-PROOFLINE_TEST_PSQL="host=/tmp port=5432 user=postgres dbname=proofline_test" python -m unittest discover -s tests -t .   # + database tests
+# Only after independently verifying this is a disposable test database:
+$env:PROOFLINE_TEST_PSQL = "host=localhost port=5432 user=proofline dbname=proofline_test"
+$env:PROOFLINE_ALLOW_DESTRUCTIVE_TESTS = "YES_I_CREATED_A_DISPOSABLE_TEST_DATABASE"
+python -m unittest discover -s tests -t .              # + database tests, including table truncation
 ```
-These were run with `unittest`. The files are plain `unittest` classes, so `pytest` should also collect them, but that was not run.
+The test harness refuses to connect unless the explicit acknowledgement is present and the configured database name contains `test`. Supply any password through a protected PostgreSQL password file, not in the connection variable or shell history. These were run with `unittest`. The files are plain `unittest` classes, so `pytest` should also collect them, but that was not run.
 Create a disposable test database first and apply the plain-Postgres migrations to it with `DATABASE_URL=<test-db> ./scripts/migrate.sh` from `backend/`. The database tests truncate tables. Never point them at a real or production database.
 
 ## Security model

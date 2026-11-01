@@ -3,7 +3,9 @@ PostgreSQL through the `psql` client. It exists so the SQL layer can be exercise
 psycopg driver cannot be installed. With the real dependencies installed you can ignore it and use
 a normal SQLAlchemy engine (see README).
 
-Enable with env PROOFLINE_TEST_PSQL="host=/tmp port=54329 user=proofline dbname=proofline_test".
+Enable only for a disposable database whose name contains 'test':
+PROOFLINE_TEST_PSQL="host=/tmp port=54329 user=proofline dbname=proofline_test"
+PROOFLINE_ALLOW_DESTRUCTIVE_TESTS="YES_I_CREATED_A_DISPOSABLE_TEST_DATABASE"
 """
 from __future__ import annotations
 
@@ -18,8 +20,26 @@ import uuid
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
+_DESTRUCTIVE_TEST_ACK = "YES_I_CREATED_A_DISPOSABLE_TEST_DATABASE"
+
+
+def _test_connection_config() -> dict[str, str] | None:
+    raw = os.getenv("PROOFLINE_TEST_PSQL", "").strip()
+    if not raw or os.getenv("PROOFLINE_ALLOW_DESTRUCTIVE_TESTS") != _DESTRUCTIVE_TEST_ACK:
+        return None
+    try:
+        values = dict(part.split("=", 1) for part in raw.split())
+    except ValueError:
+        return None
+    database = values.get("dbname", "").lower()
+    if "test" not in database or not all(values.get(key) for key in ("host", "port", "user", "dbname")):
+        return None
+    return values
+
+
 def enabled() -> bool:
-    return bool(os.getenv("PROOFLINE_TEST_PSQL"))
+    """Only enable destructive SQL tests after explicit disposable-target opt-in."""
+    return _test_connection_config() is not None
 
 
 def _lit(v) -> str:
@@ -55,7 +75,9 @@ class _Result:
 
 class PsqlConn:
     def __init__(self):
-        kv = dict(p.split("=", 1) for p in os.environ["PROOFLINE_TEST_PSQL"].split())
+        kv = _test_connection_config()
+        if kv is None:
+            raise RuntimeError("Database tests require an explicitly confirmed disposable database whose name contains 'test'.")
         self.p = subprocess.Popen(
             ["psql", "-X", "-q", "-A", "-t", "-h", kv["host"], "-p", kv["port"], "-U", kv["user"], "-d", kv["dbname"]],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
