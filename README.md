@@ -4,7 +4,7 @@ Proofline is a React/TypeScript frontend paired with the FastAPI backend and Pos
 
 ## Configure local development
 
-1. Create a Supabase project and apply the SQL migrations in `supabase/` (or use `backend/scripts/migrate.sh --supabase` with the backend setup described in `BACKEND_README.md`). Set the project database connection string.
+1. Create and positively verify a separate disposable Supabase development project before applying SQL migrations in `supabase/` (or using `backend/scripts/migrate.sh --supabase`). Never run migrations against the currently configured project until its role and a backup are confirmed. See [DEVELOPMENT_BACKUP.md](DEVELOPMENT_BACKUP.md).
 2. In Supabase Auth, enable email confirmations and the Google provider. Configure Google OAuth credentials in Supabase, and allow your local frontend origin (`http://127.0.0.1:5173`) in Supabase's redirect URL settings. Google’s authorized redirect URI must be the callback URL shown in the Supabase provider settings.
 3. Copy `.env.example` to the project root as `.env`. Fill in `DATABASE_URL`, `SUPABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY` for FastAPI. Keep secrets out of Vite variables. For the frontend, copy `.env.example` to `.env.local` and set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` (the public anon/publishable key); leave `VITE_API_BASE` blank when using the local Vite proxy.
 4. From `backend/`, create a virtual environment, install `requirements.txt`, and run `uvicorn app.main:app --reload --port 8000`. The backend reads the project-root `.env` file as well as process environment variables.
@@ -18,7 +18,7 @@ The UI uses the implemented FastAPI routes under `/api`: workspaces/profiles/mem
 
 No LLM or search credentials are included. The deterministic review can run without them; semantic/search stages report unavailable until configured. The supplied backend README documents additional extraction and deployment limitations.
 
-Each review stores an immutable automated governance result with a bounded risk score, policy version, and reason factors. Image palette screening and public-page monitoring are available in partial form; logo/layout analysis and proof provenance are still unavailable, so the fail-closed policy holds submissions rather than granting automatic approval. High-severity violations of approved brand rules are rejected. Apply migrations `0004`–`0008` before using the new APIs. Run the scheduled monitor separately with `python -m app.services.monitor_worker --poll-seconds 30` from `backend/`.
+Each review stores an immutable automated governance result with a bounded risk score, policy version, and reason factors. Image palette screening and public-page monitoring are available in partial form; logo/layout analysis and proof provenance are still unavailable, so the fail-closed policy holds submissions rather than granting automatic approval. High-severity violations of approved brand rules are rejected. Apply migrations `0004`–`0009` to the verified disposable development project before using the new APIs. Run the scheduled monitor separately with `python -m app.services.monitor_worker --poll-seconds 30` from `backend/` only after development-database verification.
 
 ## Useful checks
 
