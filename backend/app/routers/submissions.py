@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from sqlalchemy import Connection
 
@@ -198,7 +198,7 @@ def list_evidence(version_id: UUID, m: Member = Depends(member_of()), conn: Conn
 
 
 _LIST_SQL = """
-select s.id, s.title, s.created_at, s.brand_profile_id, sv.id version_id, sv.version_no, sv.source_type,
+select s.id, s.title, s.created_at, s.brand_profile_id, u.email owner_email, sv.id version_id, sv.version_no, sv.source_type,
        sv.extraction_status, sv.created_at version_created_at,
        (select r.status from review_runs r where r.submission_version_id = sv.id order by r.started_at desc limit 1) last_run_status,
        (select r.id from review_runs r where r.submission_version_id = sv.id order by r.started_at desc limit 1) last_run_id,
@@ -210,17 +210,19 @@ select s.id, s.title, s.created_at, s.brand_profile_id, sv.id version_id, sv.ver
           where f.submission_version_id = sv.id and f.status = 'open'
             and r.id = (select r2.id from review_runs r2 where r2.submission_version_id = sv.id order by r2.started_at desc limit 1)) open_findings
 from submissions s join submission_versions sv on sv.id = s.current_version_id
+left join app_users u on u.id = s.created_by
 where s.workspace_id = :w order by s.created_at desc limit 200"""
 
 
 @router.get("/submissions")
-def list_submissions(m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
-    return q(conn, _LIST_SQL, w=m.workspace_id)
+def list_submissions(brand_profile_id: Optional[UUID] = Query(None), m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
+    return q(conn, _LIST_SQL.replace("where s.workspace_id = :w", "where s.workspace_id = :w and (cast(:bp as uuid) is null or s.brand_profile_id = :bp)"),
+             w=m.workspace_id, bp=brand_profile_id)
 
 
 @router.get("/submissions/{submission_id}")
 def get_submission(submission_id: UUID, m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
-    sub = q1(conn, "select id, title, brand_profile_id, current_version_id, created_at from submissions where id = :s and workspace_id = :w",
+    sub = q1(conn, "select s.id, s.title, s.brand_profile_id, s.current_version_id, s.created_at, u.email owner_email from submissions s left join app_users u on u.id=s.created_by where s.id = :s and s.workspace_id = :w",
              s=submission_id, w=m.workspace_id)
     if not sub:
         raise HTTPException(404, "Submission not found")

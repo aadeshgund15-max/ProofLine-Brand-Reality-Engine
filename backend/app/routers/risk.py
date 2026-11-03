@@ -1,15 +1,19 @@
 """Unified, evidence-backed queue for unresolved review findings and web changes."""
-from fastapi import APIRouter, Depends
+from typing import Optional
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import Connection
 
 from app.auth import Member, member_of
-from app.db import get_conn, q
+from app.db import get_conn, q, table_exists
 
 router = APIRouter(prefix="/api/workspaces/{workspace_id}")
 
 
 @router.get("/risk-queue")
-def risk_queue(m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
+def risk_queue(m: Member = Depends(member_of()), conn: Connection = Depends(get_conn),
+               brand_profile_id: Optional[UUID] = Query(None)):
     findings = q(conn, """select 'finding' item_type,f.id item_id,s.title source_label,s.id source_id,
                               f.title,f.explanation,f.severity,f.verification_status assessment,f.status,
                               f.created_at,coalesce(d.risk_score,0) risk_score,d.outcome automated_outcome,
@@ -18,7 +22,8 @@ def risk_queue(m: Member = Depends(member_of()), conn: Connection = Depends(get_
                        join submission_versions sv on sv.id=f.submission_version_id
                        join submissions s on s.id=sv.submission_id
                        left join automated_decisions d on d.review_run_id=r.id
-                       where f.workspace_id=:w and f.status in ('open','needs_investigation')""", w=m.workspace_id)
+                       where f.workspace_id=:w and f.status in ('open','needs_investigation')
+                         and (cast(:bp as uuid) is null or s.brand_profile_id=:bp)""", w=m.workspace_id, bp=brand_profile_id)
     changes = q(conn, """select 'monitoring_change' item_type,c.id item_id,s.label source_label,s.id source_id,
                              c.change_summary title,c.change_excerpt explanation,'medium' severity,
                              coalesce(r.status,'needs_review') assessment,c.status,c.created_at,
@@ -26,7 +31,10 @@ def risk_queue(m: Member = Depends(member_of()), conn: Connection = Depends(get_
                              0 evidence_count
                       from monitoring_changes c join monitored_sources s on s.id=c.monitored_source_id
                       left join monitoring_change_reviews r on r.change_id=c.id
-                      where c.workspace_id=:w and c.status='open'""", w=m.workspace_id)
+                      where c.workspace_id=:w and c.status='open'
+                        and (cast(:bp as uuid) is null or s.brand_profile_id=:bp)""", w=m.workspace_id, bp=brand_profile_id) \
+        if all(table_exists(conn, table) for table in
+               ("monitoring_changes", "monitored_sources", "monitoring_change_reviews")) else []
     items = findings + changes
     items.sort(key=lambda x: (x.get("risk_score", 0), x.get("created_at")), reverse=True)
     return items[:200]

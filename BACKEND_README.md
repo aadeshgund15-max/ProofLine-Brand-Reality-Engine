@@ -11,11 +11,12 @@ is still in progress; see the verification status and limitations below before p
 
 | Area | Status |
 |---|---|
-| Backend unit tests | **116 passed; 3 skipped** (two database-backed tests require an explicitly acknowledged disposable database; OCR integration needs the Tesseract executable) |
-| Frontend typecheck, lint, tests, production build | **Passed locally; 4 frontend unit tests** |
+| Backend unit tests | **146 passed; 3 skipped (149 total)** in the latest local run (two database-backed test groups require a reachable disposable database; OCR integration needs the Tesseract executable) |
+| Frontend typecheck, lint, tests, production build | **Passed locally; 7 frontend tests** |
 | Migration 0003 plain-Postgres compatibility | Supabase-only RLS setup is capability-guarded; **not executed against a database in this environment** |
-| SQL integration, migrations 0001–0009, Supabase RLS, workspace isolation against a real database | **Not verified in this pass**; the configured project could not be identified as the disposable development project |
+| SQL integration, migrations 0001–0009, Supabase RLS, workspace isolation against a real database | **Not verified**; the running backend now reports database readiness. The ledger lists only 0001 and 0002, while `submission_evidence` exists without a 0003 ledger entry. Later route dependencies are missing, and backups are not verified |
 | Live Tavily/Brave/LLM connectivity and end-to-end product research | **Not verified**; provider configuration is missing |
+| Dependency vulnerability audit | **Blocked**; npm audit could not reach registry.npmjs.org in this environment; pip-audit is unavailable |
 
 Caveats you should know about:
 1. Database-backed tests truncate test tables and must only use a separately created disposable database. No database-writing test was run here.
@@ -23,6 +24,8 @@ Caveats you should know about:
 3. No search or LLM provider was called live. Provider adapters are present, but current environment variables do not configure them.
 4. No Round 3 migrations were applied and nothing was deployed or load-tested.
 5. [DEVELOPMENT_BACKUP.md](DEVELOPMENT_BACKUP.md) documents a development backup and isolated restore-check procedure for PostgreSQL and private Supabase Storage. The required export/restore tools were unavailable here, so no backup was created or restore verified.
+6. The report-renderer regression test checks product research coverage, source-triage caveats, reviewer decisions, and revision/audit history. A PDF report from live database records has not been tested.
+7. Evidence-file keyword overlap is recorded only as `partially_supported` and requires human review. It is never treated as proof of truth or falsity.
 
 ## Run it
 
@@ -39,7 +42,7 @@ DATABASE_URL=postgresql://... ./scripts/migrate.sh --supabase   # Supabase: also
 DATABASE_URL=postgresql://... ./scripts/migrate.sh              # plain Postgres: skips 0002
 ```
 
-**API**: `uvicorn app.main:app --reload --port 8000` (`GET /api/health` is liveness; `GET /api/health/ready` performs a read-only database readiness check)
+**API**: `uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` (`GET /api/health` is liveness; `GET /api/health/ready` performs a read-only database readiness check). The explicit IPv4 bind matches Vite's local API proxy.
 
 **Auth modes**
 - `AUTH_MODE=supabase`: the client signs in with Supabase Auth and sends its access token as `Authorization: Bearer`. Set
@@ -103,21 +106,31 @@ listed term (a known wrong variant) are flagged.
   visual or proof-provenance stages produce `on_hold`; approved high-severity rule violations produce `rejected`. Search-provider
   excerpts are never enough to produce `approved`. Full source reliability and the remaining visual checks are still required,
   so automatic approval is not reachable in the current product flow.
-- Phase 2 adds a private owner-managed image reference library, versioned palettes, and CIE76 dominant-color screening for image
-  submissions. Logo matching, typography, layout, PDF-page, and slide checks remain unavailable; image results therefore stay
-  partial and cannot authorize approval.
-- Phase 3 adds workspace-scoped public URL registration, SSRF-safe text snapshots, change alerts, retry/backoff logs, and a
-  background worker. Run a separate process from `backend/`: `python -m app.services.monitor_worker --poll-seconds 30`.
-  Changed pages receive a deterministic/optional-provider re-review report, which remains on hold until mandatory proof and visual
-  stages are available. Monitoring covers readable HTML and plain text; it does not render JavaScript or inspect page images.
+- Governance risk weights can be overridden with server-only `PROOFLINE_GOVERNANCE_POLICY_JSON`, for example
+  `{"version":"policy-2026-11","weights":{"missing_user_proof":40,"contradicted_claim":55}}`. Allowed weight keys and
+  ranges are validated in `app/core/governance.py`; invalid configuration fails the review rather than silently using defaults.
+  The safety outcome rules remain fail-closed. Every stored automated decision records the selected policy version.
+- Phase 2 adds a private owner-managed image reference library, versioned palettes, and configurable CIE76 dominant-color screening
+  for image submissions and the first ten rendered pages of uploaded PDFs. Candidate color regions retain page/image coordinates.
+  Approved raster logos are compared against separate raster image objects in PDF/PPTX files with a 64-bit perceptual hash; likely
+  matches, aspect changes, rotation, and mirroring are sent to human review, never auto-approved. DOCX/PDF/PPTX font metadata and
+  page/slide margin bounds can be checked against server-configured rules. Theme-inherited fonts, vector or page-composite logos,
+  semantic layout intent, full-slide color rendering, and general logo misuse detection remain unavailable.
+- Phase 3 adds workspace-scoped public URL registration, SSRF-safe text snapshots, bounded hashes of up to eight publicly
+  referenced HTML image assets, change alerts, retry/backoff logs, and a background worker. Run a separate process from
+  `backend/`: `python -m app.services.monitor_worker --poll-seconds 30`. A complete pair of image manifests is required before
+  an asset difference is reported; failed asset fetches remain unknown. Changed current images are compared with approved raster
+  logos and the candidate comparison is stored with the deterministic/optional-provider text re-review report. Removed images
+  cannot be visually inspected after removal. The review remains on hold until mandatory proof and visual stages are complete;
+  monitoring does not render JavaScript or decide whether changed image assets comply with brand rules.
 - Product Intelligence adds a workspace-scoped product registry and a background research queue. Each run executes twelve
   category-focused queries through the configured Tavily or Brave provider, stores the query-to-source relationships, retrieves
   public pages through the SSRF-safe fetcher, detects duplicate content, and reuses successful page fetches for 24 hours. The
   profile records the user-supplied identity and source coverage; it does not synthesize verified specifications from raw pages.
   During submission review, readable pages from the latest research run are checked against each detected claim only when an
   exact model identifier or supplied official domain matched. Exact source passages and product research source IDs are saved in
-  finding evidence. This is model-assisted triage, not independent proof. Domain classifications are candidates only. Source
-  Source records now include versioned, explainable triage signals for authority candidates, independence, freshness, directness,
+  finding evidence. This is model-assisted triage, not independent proof. Domain classifications are candidates only. Product source
+  records include versioned, explainable triage signals for authority candidates, independence, freshness, directness,
   methodology indicators, possible disclosures, and duplicate content. These rules do not verify source authority, certify a
   product, establish corroboration, or replace human review. Product identity must be confirmed by a user and a
   matching identifier or supplied official domain must appear in an inspected source for the research gate to complete.
@@ -128,8 +141,9 @@ that fetched text are classified as support or contradiction; a result snippet a
 requires human review. The source signal record is triage metadata; claim-level source reliability and corroboration remain
 human-review responsibilities.
 
-Apply migrations `0004_automated_decisions.sql` through `0009_source_quality_assessments.sql` before
-using these endpoints. The app does not apply schema changes automatically.
+On a project where `0001`–`0003` are already applied, apply unapplied migrations `0004`–`0009` before
+using these endpoints. A new disposable project starts with `0001`; inspect its platform compatibility and
+migration ledger before applying the ordered sequence. The app does not apply schema changes automatically.
 
 ---
 

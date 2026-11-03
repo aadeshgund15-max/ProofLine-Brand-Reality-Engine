@@ -3,6 +3,7 @@ supabase/migrations is the source of truth."""
 from __future__ import annotations
 
 import json
+import re
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -50,6 +51,13 @@ def q1(conn: Connection, sql: str, **params: Any) -> dict | None:
 
 def ex(conn: Connection, sql: str, **params: Any) -> None:
     conn.execute(text(sql), params)
+
+
+def table_exists(conn: Connection, table_name: str) -> bool:
+    if not re.fullmatch(r"[a-z_][a-z0-9_]*", table_name):
+        raise ValueError("Invalid table name")
+    row = q1(conn, "select to_regclass(:name) relation", name=f"public.{table_name}")
+    return bool(row and row["relation"])
 
 
 def jb(value: Any) -> str:

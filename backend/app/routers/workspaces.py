@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import Connection
 
@@ -126,21 +126,30 @@ def create_profile(body: ProfileIn, m: Member = Depends(member_of(*auth.EDIT_ROL
 
 # ------------------------------------------------------------------------- dashboard
 @router.get("/workspaces/{workspace_id}/dashboard")
-def dashboard(m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
+def dashboard(m: Member = Depends(member_of()), conn: Connection = Depends(get_conn),
+              brand_profile_id: Optional[UUID] = Query(None)):
     """Every number is an aggregate over persisted rows."""
     w = m.workspace_id
-    one = lambda sql: q1(conn, sql, w=w)["n"]
+    one = lambda sql: q1(conn, sql, w=w, bp=brand_profile_id)["n"]
     return {
-        "facts": one("select count(*) n from brand_facts where workspace_id = :w"),
+        "facts": one("select count(*) n from brand_facts where workspace_id = :w and (cast(:bp as uuid) is null or brand_profile_id=:bp)"),
         "approved_facts": one("""select count(*) n from brand_fact_versions v
                                  join brand_facts f on f.current_version_id = v.id
-                                 where f.workspace_id = :w and v.status = 'approved'"""),
-        "rules": one("select count(*) n from brand_rules where workspace_id = :w"),
-        "submissions": one("select count(*) n from submissions where workspace_id = :w"),
-        "review_runs": one("select count(*) n from review_runs where workspace_id = :w"),
-        "open_findings": one("select count(*) n from findings where workspace_id = :w and status = 'open'"),
-        "open_findings_high": one("select count(*) n from findings where workspace_id = :w and status = 'open' and severity = 'high'"),
-        "impact_review_required": one("select count(*) n from impact_records where workspace_id = :w and status = 'review_required'"),
+                                 where f.workspace_id = :w and (cast(:bp as uuid) is null or f.brand_profile_id=:bp) and v.status = 'approved'"""),
+        "rules": one("select count(*) n from brand_rules where workspace_id = :w and (cast(:bp as uuid) is null or brand_profile_id=:bp)"),
+        "submissions": one("select count(*) n from submissions where workspace_id = :w and (cast(:bp as uuid) is null or brand_profile_id=:bp)"),
+        "review_runs": one("""select count(*) n from review_runs r join submission_versions sv on sv.id=r.submission_version_id
+                             join submissions s on s.id=sv.submission_id where r.workspace_id=:w
+                             and (cast(:bp as uuid) is null or s.brand_profile_id=:bp)"""),
+        "open_findings": one("""select count(*) n from findings f join submission_versions sv on sv.id=f.submission_version_id
+                               join submissions s on s.id=sv.submission_id where f.workspace_id=:w and f.status='open'
+                               and (cast(:bp as uuid) is null or s.brand_profile_id=:bp)"""),
+        "open_findings_high": one("""select count(*) n from findings f join submission_versions sv on sv.id=f.submission_version_id
+                                    join submissions s on s.id=sv.submission_id where f.workspace_id=:w and f.status='open'
+                                    and f.severity='high' and (cast(:bp as uuid) is null or s.brand_profile_id=:bp)"""),
+        "impact_review_required": one("""select count(*) n from impact_records i join submissions s on s.id=i.submission_id
+                                       where i.workspace_id=:w and i.status='review_required'
+                                       and (cast(:bp as uuid) is null or s.brand_profile_id=:bp)"""),
         "recent_activity": q(conn, """select id, event_type, summary, created_at from audit_events
                                       where workspace_id = :w order by id desc limit 8""", w=w),
     }

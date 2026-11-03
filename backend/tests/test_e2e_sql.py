@@ -48,13 +48,13 @@ class Scenario(unittest.TestCase):
             cls.bp = workspaces.create_profile(workspaces.ProfileIn(name="Acme brand"), cls.m, c)["id"]
             cls.price = library.create_fact(library.FactIn(
                 brand_profile_id=cls.bp, key="pro_price", name="Pro price", approved_value="$799", value_type="money",
-                subject_terms=["Acme Pro"]), cls.m, c)
+                subject_terms=["Acme Pro"], status="approved"), cls.m, c)
             cls.launch = library.create_fact(library.FactIn(
                 brand_profile_id=cls.bp, key="launch", name="Launch date", approved_value="14 March 2026",
-                value_type="date", subject_terms=["launch"]), cls.m, c)
+                value_type="date", subject_terms=["launch"], status="approved"), cls.m, c)
             cls.rule = library.create_rule(library.RuleIn(
                 brand_profile_id=cls.bp, key="no_superlatives", rule_type="prohibited_phrase", severity="high",
-                description="Do not claim to be the best phone ever.", patterns=["best phone ever"]), cls.m, c)
+                description="Do not claim to be the best phone ever.", patterns=["best phone ever"], status="approved"), cls.m, c)
 
     def submit(self, title, text):
         with PsqlConn() as c:

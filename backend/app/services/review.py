@@ -7,6 +7,7 @@ transaction. If the essential deterministic stage raises, nothing partial is sto
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from typing import Optional
 from uuid import UUID
 
@@ -15,9 +16,10 @@ from sqlalchemy import Connection
 from app.audit import audit
 from app.core.checks import ENGINE_VERSION, FactV, RawFinding, RuleV, run_checks
 from app.core.governance import AutomatedDecision
-from app.core.visual import analyze_palette
+from app.core.visual import (analyze_document_typography_layout, analyze_logo_references,
+                             analyze_palette)
 from app.core.verification import SEMANTIC_ENGINE, fetch_claim_source, run_semantic_review, verify_claims
-from app.db import ex, jb, q, q1, transaction
+from app.db import ex, jb, q, q1, table_exists, transaction
 from app.extract import locate
 from app.providers.base import LlmProvider, ProviderError, SearchProvider
 
@@ -57,7 +59,12 @@ class Computed:
 def compute_review(sv: dict, facts: list[FactV], rules: list[RuleV], search: SearchProvider,
                    llm: LlmProvider, brand_context: str = "", image_bytes: Optional[bytes] = None,
                    approved_colors: Optional[list[str]] = None,
-                   product_sources: Optional[list[dict]] = None) -> Computed:
+                   product_sources: Optional[list[dict]] = None,
+                   visual_pages: Optional[list[dict]] = None,
+                   visual_page_count: Optional[int] = None,
+                   visual_assets: Optional[list[dict]] = None,
+                   approved_logos: Optional[list[dict]] = None,
+                   document_bytes: Optional[bytes] = None) -> Computed:
     text = sv["extracted_text"]
     c = Computed()
     # Stage A: deterministic (essential: exceptions propagate)
@@ -68,23 +75,119 @@ def compute_review(sv: dict, facts: list[FactV], rules: list[RuleV], search: Sea
     c.stages["deterministic"] = {"status": "completed", "message": f"{len(det.findings)} finding(s) from "
                                  f"{len(c.fact_versions)} fact(s) and {len(c.rule_versions)} rule(s)."}
     warn = False
-    if image_bytes is not None and approved_colors:
+    pages = visual_pages or ([{"page_number": 1, "image_bytes": image_bytes}] if image_bytes is not None else [])
+    if pages and approved_colors:
         try:
-            visual = analyze_palette(image_bytes, approved_colors)
-            c.visual_details = visual
-            c.stages["visual"] = {"status": "partial", "message": "Color palette inspected; logo, typography, and layout checks are not implemented.",
-                                   "findings": len(visual["findings"]), "dominant_colors": visual["dominant_colors"]}
-            for vf in visual["findings"]:
-                c.findings.append(RawFinding(
-                    origin="visual", category="unapproved_color", title="Possible unapproved dominant color",
-                    explanation=(f"{vf['color']} covers {vf['coverage']:.0%} of the image and is ΔE {vf['delta_e']} "
-                                 f"from nearest approved color {vf['nearest_approved']}. Photos and rendering effects can explain this difference."),
-                    severity="medium", excerpt=vf["color"], verification_status="needs_human_review"))
+            delta_threshold = float(os.getenv("PROOFLINE_VISUAL_DELTA_E_THRESHOLD", "18"))
+            coverage_threshold = float(os.getenv("PROOFLINE_VISUAL_COVERAGE_THRESHOLD", "0.12"))
+            page_results = []
+            all_findings = []
+            for page in pages:
+                result = analyze_palette(page["image_bytes"], approved_colors,
+                                         delta_threshold=delta_threshold,
+                                         coverage_threshold=coverage_threshold)
+                page_number = int(page.get("page_number", len(page_results) + 1))
+                page_results.append({"page_number": page_number, **result})
+                for vf in result["findings"]:
+                    finding = {**vf, "page_number": page_number}
+                    all_findings.append(finding)
+                    c.findings.append(RawFinding(
+                        origin="visual", category="unapproved_color", title="Possible unapproved dominant color",
+                        explanation=(f"Page {page_number}: {vf['color']} covers {vf['coverage']:.0%} of the page and is ΔE {vf['delta_e']} "
+                                     f"from nearest approved color {vf['nearest_approved']}. Photos and rendering effects can explain this difference."),
+                        severity="medium", excerpt=f"Page {page_number}: {vf['color']}", verification_status="needs_human_review",
+                        location={"label": f"Page {page_number}" if visual_page_count is not None else "Uploaded image",
+                                  "kind": "page" if visual_page_count is not None else "image",
+                                  **(vf.get("coordinates") or {})}))
+            truncated = visual_page_count is not None and visual_page_count > len(pages)
+            c.visual_details = {"status": "completed", "method": "CIE76 dominant-color distance",
+                                "delta_threshold": delta_threshold, "coverage_threshold": coverage_threshold,
+                                "page_count": visual_page_count or len(pages), "pages_analyzed": len(page_results),
+                                "truncated": truncated, "pages": page_results, "findings": all_findings,
+                                "limitations": ["Palette screening can flag colors in photographs, gradients, shadows, and antialiasing.",
+                                                "Logo identity, typography, and layout are not analyzed."]}
+            c.stages["visual"] = {"status": "partial", "message": (
+                f"Color palette screened on {len(page_results)} page(s)" + (f" of {visual_page_count}; remaining pages were not analyzed." if truncated else ".") +
+                " Logo, typography, and layout are not analyzed."),
+                "findings": len(all_findings), "pages_analyzed": len(page_results),
+                "page_count": visual_page_count or len(page_results), "truncated": truncated}
         except ValueError as e:
             c.visual_details = {"status": "failed", "message": str(e)}
-            c.stages["visual"] = {"status": "failed", "message": "Image palette analysis failed."}
+            c.stages["visual"] = {"status": "failed", "message": "Image or PDF page palette analysis failed."}
     else:
-        c.stages["visual"] = {"status": "unavailable", "message": "Visual analysis requires an image upload and an approved palette. Logo, typography, and layout checks are not implemented."}
+        c.stages["visual"] = {"status": "unavailable", "message": "Palette screening needs an image or rendered PDF page and an approved palette. Typography and layout checks are not implemented."}
+    logo_analysis = analyze_logo_references(visual_assets or [], approved_logos or [],
+                                             max_hamming_distance=int(os.getenv("PROOFLINE_LOGO_MAX_HASH_DISTANCE", "7")))
+    c.visual_details["logo_analysis"] = logo_analysis
+    for item in logo_analysis.get("matches", []):
+        page_label = f"Slide {item['page_number']}" if item.get("asset_kind") == "pptx_image" and item.get("page_number") else (
+            f"Page {item['page_number']}" if item.get("page_number") else "Uploaded image")
+        if item["status"] == "unrecognized_logo_candidate":
+            title = "Logo candidate does not match an approved reference"
+            explanation = item["message"]
+            category = "unrecognized_logo_candidate"
+        elif item.get("issues"):
+            title = "Possible logo distortion or rotation"
+            explanation = (f"{page_label}: the image resembles approved logo {item['reference_name']} "
+                           f"(perceptual hash distance {item['perceptual_hash_distance']}/64) and has "
+                           f"{', '.join(item['issues']).replace('_', ' ')}. Human review is required.")
+            category = "possible_logo_misuse"
+        else:
+            title = "Image resembles an approved logo"
+            explanation = (f"{page_label}: the image resembles approved logo {item['reference_name']} "
+                           f"(perceptual hash distance {item['perceptual_hash_distance']}/64). This similarity "
+                           "is a review lead, not identity proof.")
+            category = "logo_reference_match"
+        c.findings.append(RawFinding(origin="visual", category=category, title=title, explanation=explanation,
+                                     severity="medium" if item.get("issues") or item["status"] == "unrecognized_logo_candidate" else "low",
+                                     excerpt=page_label, verification_status="needs_human_review",
+                                     location={"label": page_label,
+                                               "kind": "slide" if item.get("asset_kind") == "pptx_image" else "page" if item.get("page_number") else "image",
+                                               **(item.get("coordinates") or {})}))
+    if approved_logos:
+        previous_visual = c.stages.get("visual", {})
+        previous_message = previous_visual.get("message", "Color palette comparison is unavailable.")
+        c.stages["visual"] = {"status": "partial", "message": (
+            f"{previous_message} Logo references compared against {logo_analysis['assets_examined']} extracted image asset(s). "
+            "Similarity findings require human confirmation; typography and layout checks are unavailable."),
+            "logo_candidates": len(logo_analysis.get("matches", []))}
+    elif c.stages.get("visual", {}).get("status") == "unavailable":
+        c.stages["visual"]["message"] += " No approved logo references are configured."
+    if document_bytes is not None:
+        try:
+            approved_fonts = [font.strip() for font in os.getenv("PROOFLINE_APPROVED_FONT_FAMILIES", "").split(",") if font.strip()]
+            min_font_size = os.getenv("PROOFLINE_FONT_MIN_SIZE_PT", "").strip()
+            max_font_size = os.getenv("PROOFLINE_FONT_MAX_SIZE_PT", "").strip()
+            min_margin = os.getenv("PROOFLINE_LAYOUT_MIN_MARGIN_INCHES", "").strip()
+            style_results = analyze_document_typography_layout(
+                document_bytes, sv["source_type"], approved_fonts=approved_fonts,
+                min_font_size_pt=float(min_font_size) if min_font_size else None,
+                max_font_size_pt=float(max_font_size) if max_font_size else None,
+                min_margin_inches=float(min_margin) if min_margin else None)
+            c.visual_details["typography_analysis"] = style_results["typography"]
+            c.visual_details["layout_analysis"] = style_results["layout"]
+            c.stages["typography"] = {"status": style_results["typography"]["status"],
+                                       "message": style_results["typography"]["message"],
+                                       "findings": len(style_results["typography"]["findings"])}
+            c.stages["layout"] = {"status": style_results["layout"]["status"],
+                                   "message": style_results["layout"]["message"],
+                                   "findings": len(style_results["layout"]["findings"])}
+            for category, section, title in (("typography", "typography", "Typography policy candidate"),
+                                             ("layout", "layout", "Possible layout margin violation")):
+                for item in style_results[section]["findings"]:
+                    label = (f"Slide {item['page_number']}" if item.get("kind") == "slide" and item.get("page_number") else
+                             f"Page {item['page_number']}" if item.get("page_number") else
+                             f"Paragraph {item['coordinates'].get('paragraph')}" if item.get("coordinates", {}).get("paragraph") else "Document")
+                    c.findings.append(RawFinding(origin="visual", category=f"visual_{category}", title=title,
+                                                 explanation=f"{label}: {item['message']} Human review is required.",
+                                                 severity="medium", excerpt=label,
+                                                 verification_status="needs_human_review",
+                                                 location={"label": label, "kind": item.get("kind", "document"),
+                                                           **(item.get("coordinates") or {})}))
+        except (ValueError, TypeError) as exc:
+            c.visual_details["typography_layout_error"] = f"Configured typography/layout checks could not run ({type(exc).__name__})."
+            c.stages["typography"] = {"status": "failed", "message": c.visual_details["typography_layout_error"]}
+            c.stages["layout"] = {"status": "failed", "message": c.visual_details["typography_layout_error"]}
     c.stages["proof_provenance"] = {"status": "unavailable", "message": "Uploaded proof provenance and source reliability are not assessed yet."}
     warn = True
     # Extraction limitations are findings in their own right
@@ -168,7 +271,8 @@ def persist_review(conn: Connection, *, workspace_id: UUID, sv: dict, user_id: U
                           values (:ws, :run, :sv, :o, :cat, :t, :e, :sev, :ex, :ss, :se, cast(:loc as jsonb), :fv, :rv, :vs)
                           returning id""",
                  ws=workspace_id, run=run_id, sv=sv["id"], o=f.origin, cat=f.category, t=f.title, e=f.explanation,
-                 sev=f.severity, ex=f.excerpt, ss=f.span_start, se=f.span_end, loc=jb(loc) if loc else None,
+                 sev=f.severity, ex=f.excerpt, ss=f.span_start, se=f.span_end,
+                 loc=jb(f.location or loc) if (f.location or loc) else None,
                  fv=UUID(f.fact_version_id) if f.fact_version_id else None,
                  rv=UUID(f.rule_version_id) if f.rule_version_id else None, vs=f.verification_status)
         ids.append(row["id"])
@@ -223,9 +327,11 @@ def persist_review(conn: Connection, *, workspace_id: UUID, sv: dict, user_id: U
        score=c.automated_decision.risk_score, rationale=c.automated_decision.rationale,
        factors=jb(c.automated_decision.factors), policy=c.automated_decision.policy_version)
     visual_status = c.stages.get("visual", {}).get("status", "unavailable")
-    ex(conn, """insert into visual_analyses(workspace_id, submission_version_id, review_run_id, status, results)
-                values (:ws,:sv,:run,:st,cast(:results as jsonb))""",
-       ws=workspace_id, sv=sv["id"], run=run_id, st=visual_status, results=jb(c.visual_details or c.stages.get("visual", {})))
+    if table_exists(conn, "visual_analyses"):
+        ex(conn, """insert into visual_analyses(workspace_id, submission_version_id, review_run_id, status, results)
+                    values (:ws,:sv,:run,:st,cast(:results as jsonb))""",
+           ws=workspace_id, sv=sv["id"], run=run_id, st=visual_status,
+           results=jb(c.visual_details or c.stages.get("visual", {})))
     return run_id
 
 

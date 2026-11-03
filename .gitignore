@@ -15,9 +15,11 @@ __pycache__/
 .env
 .env.*
 !.env.example
+!.env.production.example
 **/.env
 **/.env.*
 !**/.env.example
+!**/.env.production.example
 
 # Dependencies and generated files
 node_modules/

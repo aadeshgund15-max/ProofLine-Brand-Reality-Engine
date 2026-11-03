@@ -62,7 +62,7 @@ create table product_research_sources (
   url text not null,
   domain text not null,
   source_category text not null,
-  publisher text,
+  publisher text,  Ctrl + Shift + R
   published_at timestamptz,
   retrieved_at timestamptz not null default now(),
   access_status text not null check (access_status in ('ok','unreachable','blocked')),

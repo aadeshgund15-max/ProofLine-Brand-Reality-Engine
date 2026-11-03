@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import Connection
 
@@ -12,7 +12,7 @@ from app import auth
 from app.audit import audit
 from app.auth import Member, member_of
 from app.core.ssrf import FetchError, UnsafeUrlError, validate_url
-from app.db import ex, get_conn, q, q1
+from app.db import ex, get_conn, q, q1, table_exists
 from app.providers.base import get_search_provider
 
 router = APIRouter(prefix="/api/workspaces/{workspace_id}/product-intelligence")
@@ -49,12 +49,22 @@ def integration_status(m: Member = Depends(member_of()), conn: Connection = Depe
 
 
 @router.get("/products")
-def list_products(m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
+def list_products(brand_profile_id: Optional[UUID] = Query(None), m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
+    if not table_exists(conn, "products"):
+        return []
+    if not table_exists(conn, "product_research_runs"):
+        return [_product(row) for row in q(conn, """select p.*,null::uuid latest_run_id,
+                         null::text latest_research_status,null::timestamptz latest_researched_at,
+                         null::jsonb latest_coverage
+                         from products p
+                         where p.workspace_id=:w and (cast(:bp as uuid) is null or p.brand_profile_id=:bp)
+                         order by p.updated_at desc""", w=m.workspace_id, bp=brand_profile_id)]
     return [_product(row) for row in q(conn, """select p.*,r.id latest_run_id,r.status latest_research_status,
                      r.created_at latest_researched_at,r.coverage latest_coverage
                      from products p left join lateral (select id,status,created_at,coverage from product_research_runs
                      where product_id=p.id order by created_at desc limit 1) r on true
-                     where p.workspace_id=:w order by p.updated_at desc""", w=m.workspace_id)]
+                     where p.workspace_id=:w and (cast(:bp as uuid) is null or p.brand_profile_id=:bp)
+                     order by p.updated_at desc""", w=m.workspace_id, bp=brand_profile_id)]
 
 
 @router.post("/products", status_code=201)
@@ -117,9 +127,9 @@ def get_product(product_id: UUID, m: Member = Depends(member_of()), conn: Connec
     latest = runs[0] if runs else None
     sources = q(conn, """select id,research_run_id,title,url,domain,source_category,publisher,published_at,retrieved_at,
                          access_status,extraction_status,left(extracted_text,2000) excerpt,content_hash,duplicate_of,
-                         cached_from is not null cached,product_match_status,source_assessment,
+                         cached_from is not null cached,product_match_status,null::jsonb source_assessment,
                          (select array_agg(query_id) from product_research_query_sources x where x.source_id=product_research_sources.id) query_ids
-                         from product_research_sources where product_id=:p and (:r is null or research_run_id=:r)
+                         from product_research_sources where product_id=:p and (cast(:r as uuid) is null or research_run_id=:r)
                          order by retrieved_at desc limit 300""", p=product_id, r=latest["id"] if latest else None)
     queries = q(conn, """select id,research_run_id,category,query_text,status,result_count,error_code,executed_at
                         from product_research_queries where research_run_id=:r order by executed_at""",
@@ -134,8 +144,8 @@ def get_product(product_id: UUID, m: Member = Depends(member_of()), conn: Connec
                               select f.id finding_id,r.id review_run_id,s.title submission_title,
                                      f.excerpt claim_text,f.title finding_title,f.explanation,
                                      f.verification_status,sr.id source_id,sr.title source_title,sr.url source_url,
-                                     sr.publisher,sr.published_at,sr.excerpt evidence_excerpt,sr.search_query,
-                                     sr.product_research_source_id,prs.source_assessment,fe.stance
+                                     sr.publisher,sr.published_at,sr.excerpt evidence_excerpt,null::text search_query,
+                                     sr.product_research_source_id,null::jsonb source_assessment,fe.stance
                               from submission_product_links l
                               join latest_reviews r on r.submission_version_id=l.submission_version_id
                               join findings f on f.review_run_id=r.id and f.origin='verification'
@@ -177,7 +187,7 @@ def get_product(product_id: UUID, m: Member = Depends(member_of()), conn: Connec
 def get_source(source_id: UUID, m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
     source = q1(conn, """select id,title,url,domain,source_category,publisher,published_at,retrieved_at,access_status,
                          extraction_status,extracted_text,content_hash,duplicate_of,cached_from,product_match_status,
-                         source_assessment,
+                         null::jsonb source_assessment,
                          (select array_agg(query_id) from product_research_query_sources x where x.source_id=product_research_sources.id) query_ids
                          from product_research_sources where id=:s and workspace_id=:w""", s=source_id, w=m.workspace_id)
     if not source:

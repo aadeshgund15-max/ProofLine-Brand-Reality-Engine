@@ -6,7 +6,7 @@ import re
 from typing import Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import Connection
@@ -15,17 +15,20 @@ from app import storage
 from app.audit import audit
 from app.auth import Member, member_of
 from app.config import settings
-from app.db import ex, get_conn, jb, q, q1
+from app.db import ex, get_conn, jb, q, q1, table_exists
 from app.extract import validate_upload
 
 router = APIRouter(prefix="/api/workspaces/{workspace_id}/visual")
 
 
 @router.get("/assets")
-def list_assets(m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
+def list_assets(brand_profile_id: Optional[UUID] = Query(None), m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
+    if not table_exists(conn, "brand_assets"):
+        return []
     return q(conn, """select id, brand_profile_id, family_id, version_no, name, asset_type, category,
                              original_filename, mime_type, size_bytes, content_hash, approved, approved_by, created_at
-                      from brand_assets where workspace_id=:w order by created_at desc""", w=m.workspace_id)
+                      from brand_assets where workspace_id=:w and (cast(:bp as uuid) is null or brand_profile_id=:bp)
+                      order by created_at desc""", w=m.workspace_id, bp=brand_profile_id)
 
 
 @router.get("/assets/{asset_id}/content")
@@ -101,6 +104,8 @@ class PaletteIn(BaseModel):
 def get_palette(brand_profile_id: UUID, m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
     if not q1(conn, "select 1 from brand_profiles where id=:p and workspace_id=:w", p=brand_profile_id, w=m.workspace_id):
         raise HTTPException(404, "Brand profile not found")
+    if not table_exists(conn, "brand_palette_versions"):
+        return []
     return q(conn, """select id, brand_profile_id, version_no, colors, approved_by, created_at
                       from brand_palette_versions where workspace_id=:w and brand_profile_id=:p
                       order by version_no desc""", w=m.workspace_id, p=brand_profile_id)

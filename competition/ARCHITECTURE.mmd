@@ -1,0 +1,37 @@
+flowchart LR
+  subgraph Client[Browser]
+    UI[React + TypeScript + Vite]
+    AUTH[Supabase Auth session]
+    UI --> AUTH
+  end
+  subgraph API[FastAPI backend]
+    ROUTES[Workspace API routes]
+    ACCESS[JWT verification + membership / role checks]
+    PIPE[Review, evidence, governance]
+    SRC[SSRF-safe page fetch + source assessment]
+    REPORT[PDF report]
+    ROUTES --> ACCESS --> PIPE
+    PIPE --> SRC
+    ROUTES --> REPORT
+  end
+  subgraph Data[Verified Supabase project required]
+    DB[(PostgreSQL + RLS + immutable records)]
+    OBJ[(Private Storage bucket)]
+  end
+  subgraph Workers[Separate processes]
+    RI[Product research worker]
+    MON[Monitoring worker]
+  end
+  SEARCH[Tavily or Brave]
+  LLM[OpenAI-compatible LLM]
+  UI -->|Bearer access token /api| ROUTES
+  ACCESS --> DB
+  PIPE --> DB
+  PIPE --> OBJ
+  REPORT --> DB
+  RI --> DB
+  MON --> DB
+  RI --> SEARCH
+  PIPE --> SEARCH
+  RI --> LLM
+  PIPE --> LLM

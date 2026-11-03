@@ -69,7 +69,7 @@ class FactIn(BaseModel):
     approved_value: str = Field(min_length=1, max_length=500)
     value_type: Literal["text", "number", "money", "date"]
     subject_terms: list[str] = []
-    status: Status = "approved"
+    status: Status = "draft"
     source_record_id: Optional[UUID] = None
     effective_date: Optional[date] = None
     change_note: Optional[str] = Field(default=None, max_length=500)
@@ -119,6 +119,8 @@ def list_facts(brand_profile_id: Optional[UUID] = None, m: Member = Depends(memb
 def create_fact(body: FactIn, m: Member = Depends(member_of(*auth.EDIT_ROLES)), conn: Connection = Depends(get_conn)):
     if not q1(conn, "select 1 from brand_profiles where id = :p and workspace_id = :w", p=body.brand_profile_id, w=m.workspace_id):
         raise HTTPException(422, "Unknown brand profile")
+    if body.status == "approved" and m.role != "owner":
+        raise HTTPException(403, "Only a workspace owner can approve a brand fact")
     _check_source(conn, m.workspace_id, body.source_record_id)
     if q1(conn, "select 1 from brand_facts where brand_profile_id = :p and key = :k", p=body.brand_profile_id, k=body.key.strip()):
         raise HTTPException(409, "A fact with this key already exists in the brand profile; edit it to create a new version")
@@ -167,6 +169,11 @@ def update_fact(fact_id: UUID, body: FactUpdate, m: Member = Depends(member_of(*
     old = q1(conn, "select * from brand_fact_versions where id = :v", v=fact["current_version_id"])
     merged = {k: (getattr(body, k) if k in body.model_fields_set else old[k])
               for k in ("name", "approved_value", "value_type", "subject_terms", "status", "source_record_id", "effective_date")}
+    content_changed = any(_differs(merged[k], old[k]) for k in ("name", "approved_value", "value_type", "subject_terms", "source_record_id", "effective_date"))
+    if "status" in body.model_fields_set and merged["status"] == "approved" and m.role != "owner":
+        raise HTTPException(403, "Only a workspace owner can approve a brand fact")
+    if content_changed and "status" not in body.model_fields_set:
+        merged["status"] = "draft"
     FactIn(brand_profile_id=m.workspace_id, key=fact["key"], **{k: v for k, v in merged.items()})  # re-validate (raises 422)
     _check_source(conn, m.workspace_id, merged["source_record_id"])
     merged["approved_value"] = merged["approved_value"].strip()
@@ -198,7 +205,7 @@ class RuleIn(BaseModel):
     patterns: list[str] = Field(min_length=1)
     severity: Literal["low", "medium", "high"] = "medium"
     applies_to: list[ContentType] = []
-    status: Status = "approved"
+    status: Status = "draft"
     source_record_id: Optional[UUID] = None
     change_note: Optional[str] = Field(default=None, max_length=500)
 
@@ -248,6 +255,8 @@ def _insert_rule_version(conn, m: Member, rule_id: UUID, no: int, d: dict, note:
 def create_rule(body: RuleIn, m: Member = Depends(member_of(*auth.EDIT_ROLES)), conn: Connection = Depends(get_conn)):
     if not q1(conn, "select 1 from brand_profiles where id = :p and workspace_id = :w", p=body.brand_profile_id, w=m.workspace_id):
         raise HTTPException(422, "Unknown brand profile")
+    if body.status == "approved" and m.role != "owner":
+        raise HTTPException(403, "Only a workspace owner can approve a brand rule")
     _check_source(conn, m.workspace_id, body.source_record_id)
     if q1(conn, "select 1 from brand_rules where brand_profile_id = :p and key = :k", p=body.brand_profile_id, k=body.key.strip()):
         raise HTTPException(409, "A rule with this key already exists; edit it to create a new version")
@@ -281,6 +290,11 @@ def update_rule(rule_id: UUID, body: RuleUpdate, m: Member = Depends(member_of(*
     old = q1(conn, "select * from brand_rule_versions where id = :v", v=rule["current_version_id"])
     merged = {k: (getattr(body, k) if k in body.model_fields_set else old[k])
               for k in ("rule_type", "description", "patterns", "severity", "applies_to", "status", "source_record_id")}
+    content_changed = any(_differs(merged[k], old[k]) for k in ("rule_type", "description", "patterns", "severity", "applies_to", "source_record_id"))
+    if "status" in body.model_fields_set and merged["status"] == "approved" and m.role != "owner":
+        raise HTTPException(403, "Only a workspace owner can approve a brand rule")
+    if content_changed and "status" not in body.model_fields_set:
+        merged["status"] = "draft"
     RuleIn(brand_profile_id=m.workspace_id, key=rule["key"], **merged)  # re-validate
     _check_source(conn, m.workspace_id, merged["source_record_id"])
     merged["patterns"] = _terms(merged["patterns"])

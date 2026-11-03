@@ -14,8 +14,9 @@ from app import auth, storage
 from app.audit import audit
 from app.auth import Member, member_of
 from app.config import settings
+from app.core.visual import extract_visual_assets, render_pdf_visual_pages
 from app.core.governance import assess_review
-from app.db import ex, get_conn, jb, q, q1
+from app.db import ex, get_conn, jb, q, q1, table_exists
 from app.extract import locate
 from app.providers.base import get_llm_provider, get_search_provider
 from app.services.product_intelligence import review_gate
@@ -26,7 +27,7 @@ _hits: dict[str, deque] = defaultdict(deque)
 
 
 def _assess_evidence(claim_text: str, evidence_text: str) -> tuple[str, str, str | None]:
-    """Conservative deterministic baseline; it reports overlap, never invents proof."""
+    """Lexical triage only; keyword overlap cannot establish claim support or contradiction."""
     claim = claim_text.lower()
     proof = evidence_text.lower()
     claim_terms = {word.strip(".,!?;:()[]{}\"'") for word in claim.split() if len(word.strip(".,!?;:()[]{}\"'")) > 3}
@@ -36,16 +37,13 @@ def _assess_evidence(claim_text: str, evidence_text: str) -> tuple[str, str, str
     overlap = claim_terms & proof_terms
     if not overlap:
         return "insufficient_evidence", "No claim terms were found in the extracted evidence.", proof[:500]
-    proof_words = proof.replace(".", " ").replace(",", " ").split()
-    negated = any(
-        any(word in {"not", "no", "never", "without"} for word in proof_words[max(0, proof_words.index(term) - 3):proof_words.index(term)])
-        for term in overlap if term in proof_words
-    )
-    if negated:
-        return "contradicted", "The extracted evidence explicitly negates part of the claim.", proof[:500]
-    if len(overlap) < max(2, len(claim_terms) // 4):
-        return "partially_supported", "Some claim terms appear in the extracted evidence, but the claim is not fully established.", proof[:500]
-    return "supported", "The extracted evidence contains terms from the claim.", proof[:500]
+    # The prior keyword-count heuristic could mark copied or misleading text as
+    # supported and could misread negation by looking at the first occurrence of
+    # each word. Without a semantic verifier and source-quality assessment, all
+    # overlap is only a lead for a human reviewer, never positive proof.
+    return ("partially_supported",
+            "Some claim terms appear in the extracted evidence. This lexical match does not establish whether the claim is true or false; human review is required.",
+            proof[:500])
 
 
 def _rate_limit(user_id: str) -> None:
@@ -77,13 +75,15 @@ def run_review(version_id: UUID, m: Member = Depends(member_of()), conn: Connect
     facts, rules = load_reference_versions(conn, m.workspace_id, sv["brand_profile_id"])
     brand = q1(conn, "select name from brand_profiles where id = :b", b=sv["brand_profile_id"])
     palette = q1(conn, """select colors from brand_palette_versions where workspace_id=:w and brand_profile_id=:p
-                          order by version_no desc limit 1""", w=m.workspace_id, p=sv["brand_profile_id"])
+                          order by version_no desc limit 1""", w=m.workspace_id, p=sv["brand_profile_id"]) \
+        if table_exists(conn, "brand_palette_versions") else None
     product = q1(conn, """select p.id,p.product_name,p.brand,p.manufacturer,p.model_number,p.product_category,p.market,
                               p.identity_status,r.id research_run_id,r.status research_status,r.coverage
                        from submission_product_links l join products p on p.id=l.product_id
                        left join lateral (select id,status,coverage from product_research_runs where product_id=p.id
                        order by created_at desc limit 1) r on true
-                       where l.submission_version_id=:v and l.workspace_id=:w""", v=version_id, w=m.workspace_id)
+                       where l.submission_version_id=:v and l.workspace_id=:w""", v=version_id, w=m.workspace_id) \
+        if table_exists(conn, "submission_product_links") and table_exists(conn, "products") else None
     product_context = " ".join(filter(None, [product.get("brand"), product.get("product_name"),
                          product.get("manufacturer"), product.get("model_number"), product.get("product_category"),
                          product.get("market")])) if product else ""
@@ -102,12 +102,68 @@ def run_review(version_id: UUID, m: Member = Depends(member_of()), conn: Connect
                                  and length(trim(s.extracted_text)) > 0
                                order by s.retrieved_at desc limit 12""",
                            p=product["id"], r=product["research_run_id"])
-    image_bytes = storage.get(sv["storage_path"]) if sv["source_type"] == "image" and sv.get("storage_path") else None
+    visual_document_bytes = storage.get(sv["storage_path"]) if sv.get("storage_path") and sv["source_type"] in ("image", "pdf", "pptx", "docx") else None
+    image_bytes = visual_document_bytes if sv["source_type"] == "image" else None
+    visual_pages = None
+    visual_page_count = None
+    visual_render_error = None
+    if image_bytes is not None:
+        visual_pages = [{"page_number": 1, "image_bytes": image_bytes}]
+        visual_page_count = 1
+    elif sv["source_type"] == "pdf":
+        pdf_bytes = visual_document_bytes
+        if pdf_bytes is None:
+            visual_render_error = "The stored PDF is unavailable for visual page screening."
+        else:
+            try:
+                visual_pages, visual_page_count = render_pdf_visual_pages(pdf_bytes)
+            except ValueError as exc:
+                visual_render_error = str(exc)
+    try:
+        logo_rows = q(conn, """select id,name,storage_path,size_bytes from brand_assets
+                              where workspace_id=:w and brand_profile_id=:p and asset_type='logo' and approved=true
+                                and size_bytes<=2000000
+                              order by created_at desc limit 12""", w=m.workspace_id, p=sv["brand_profile_id"]) \
+            if table_exists(conn, "brand_assets") else []
+        logo_total = q1(conn, """select count(*) n from brand_assets
+                                 where workspace_id=:w and brand_profile_id=:p and asset_type='logo' and approved=true""",
+                        w=m.workspace_id, p=sv["brand_profile_id"])["n"] if table_exists(conn, "brand_assets") else 0
+        visual_assets = extract_visual_assets(visual_document_bytes, sv["source_type"]) if visual_document_bytes and logo_rows else []
+    except ValueError as exc:
+        visual_assets = []
+        visual_render_error = str(exc)
+    approved_logos = []
+    unavailable_logos = max(0, int(logo_total) - len(logo_rows))
+    for logo in logo_rows:
+        try:
+            data = storage.get(logo["storage_path"])
+        except Exception:
+            data = None
+        if data:
+            approved_logos.append({"id": str(logo["id"]), "name": logo["name"], "image_bytes": data})
+        else:
+            unavailable_logos += 1
     try:
         computed = compute_review(sv, facts, rules, get_search_provider(), get_llm_provider(),
                                   " ".join(filter(None, [brand["name"] if brand else "", product_context])), image_bytes=image_bytes,
                                   approved_colors=palette["colors"] if palette else None,
-                                  product_sources=product_sources)
+                                  product_sources=product_sources, visual_pages=visual_pages,
+                                  visual_page_count=visual_page_count, visual_assets=visual_assets,
+                                  approved_logos=approved_logos, document_bytes=visual_document_bytes)
+        if unavailable_logos:
+            logo_details = computed.visual_details.get("logo_analysis", {})
+            limitations = list(logo_details.get("limitations", []))
+            limitations.append(f"{unavailable_logos} approved logo reference file(s) could not be loaded from private storage.")
+            logo_details["limitations"] = limitations
+        if visual_render_error:
+            computed.visual_details["palette_render_error"] = visual_render_error
+            limitations = list(computed.visual_details.get("limitations", []))
+            limitations.append("PDF page palette screening failed; other available visual checks are reported separately.")
+            computed.visual_details["limitations"] = limitations
+            visual_stage = computed.stages.setdefault("visual", {})
+            if visual_stage.get("status") == "unavailable":
+                visual_stage["status"] = "failed"
+            visual_stage["message"] = (visual_stage.get("message", "") + " " + visual_render_error).strip()
         product_status, product_message = review_gate(product)
         computed.stages["product_intelligence"] = {
             "status": product_status,
@@ -166,7 +222,8 @@ def get_run(run_id: UUID, m: Member = Depends(member_of()), conn: Connection = D
                              where a.review_run_id = :r order by a.created_at""", r=run_id)
     automated_decision = q1(conn, """select outcome, risk_score, rationale, factors, policy_version, created_at
                                       from automated_decisions where review_run_id = :r""", r=run_id)
-    visual_analysis = q1(conn, """select status, results, created_at from visual_analyses where review_run_id=:r""", r=run_id)
+    visual_analysis = q1(conn, """select status, results, created_at from visual_analyses where review_run_id=:r""", r=run_id) \
+        if table_exists(conn, "visual_analyses") else None
     return {**run, "findings": findings, "fact_versions_used": facts, "rule_versions_used": rules,
             "evidence_assessments": assessments, "automated_decision": automated_decision,
             "visual_analysis": visual_analysis}
@@ -188,8 +245,8 @@ def get_finding(finding_id: UUID, m: Member = Depends(member_of()), conn: Connec
                                  fv.version_no fact_version_no, fv.name fact_name, fv.approved_value, fv.id fact_version_id,
                                  rv.version_no rule_version_no, rv.rule_type, rv.description rule_description, rv.id rule_version_id,
                                  sr.id source_id, sr.title source_title, sr.url source_url, sr.publisher, sr.retrieved_at,
-                                 sr.published_at, sr.access_status, sr.search_query, sr.extraction_status,
-                                 sr.product_research_source_id
+                                 sr.published_at, sr.access_status, null::text search_query, null::text extraction_status,
+                                 null::uuid product_research_source_id
                           from finding_evidence e
                           left join brand_fact_versions fv on fv.id = e.fact_version_id
                           left join brand_rule_versions rv on rv.id = e.rule_version_id

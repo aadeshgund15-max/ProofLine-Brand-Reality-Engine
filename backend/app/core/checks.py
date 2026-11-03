@@ -67,6 +67,7 @@ class RawFinding:
     fact_version_id: Optional[str] = None
     rule_version_id: Optional[str] = None
     verification_status: str = "not_applicable"
+    location: Optional[dict] = None
 
 
 @dataclass(frozen=True)

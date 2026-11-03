@@ -51,9 +51,9 @@ class Base(unittest.TestCase):
         with PsqlConn() as c:
             cls.bp = workspaces.create_profile(workspaces.ProfileIn(name="B"), cls.m, c)["id"]
             library.create_fact(library.FactIn(brand_profile_id=cls.bp, key="price", name="Price", approved_value="$899",
-                                               value_type="money", subject_terms=["Acme Pro Phone", "Acme Pro"]), cls.m, c)
+                                               value_type="money", subject_terms=["Acme Pro Phone", "Acme Pro"], status="approved"), cls.m, c)
             library.create_rule(library.RuleIn(brand_profile_id=cls.bp, key="sup", rule_type="claim_requires_evidence",
-                                               description="Superlatives need evidence.", patterns=["best phone ever"]), cls.m, c)
+                                               description="Superlatives need evidence.", patterns=["best phone ever"], status="approved"), cls.m, c)
 
     def sub(self, source_type, **kw):
         with PsqlConn() as c:

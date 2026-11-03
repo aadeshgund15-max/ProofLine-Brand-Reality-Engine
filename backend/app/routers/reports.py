@@ -13,7 +13,7 @@ from fastapi.responses import Response
 from sqlalchemy import Connection
 
 from app.auth import Member, member_of
-from app.db import get_conn, q, q1
+from app.db import get_conn, q, q1, table_exists
 
 router = APIRouter(prefix="/api/workspaces/{workspace_id}")
 
@@ -93,9 +93,19 @@ def render_review_report(data: dict[str, Any]) -> bytes:
                                f"profile extraction {_text(coverage.get('profile_extraction_status', 'not recorded'))}.",
                                styles["BodyText"]))
         for source in profile.get("sources") or []:
+            assessment = source.get("source_assessment") or {}
+            signals = assessment.get("signals") or {}
+            triage = "; ".join(
+                f"{label}: {(signals.get(key) or {}).get('status', 'unknown')}"
+                for label, key in (("authority", "authority"), ("relevance", "relevance"),
+                                   ("independence", "independence"), ("freshness", "freshness"),
+                                   ("directness", "directness"))
+            )
             story.append(Paragraph(f"Source: {_text(source.get('title'))} · {_text(source.get('url'))} · "
-                                   f"{_text(source.get('access_status'))} / {_text(source.get('extraction_status'))} · "
-                                   f"product match {_text(source.get('product_match_status'))}", styles["Small"]))
+                                   f"publisher {_text(source.get('publisher'))} · published {_text(source.get('published_at'))}<br/>"
+                                   f"Access/extraction {_text(source.get('access_status'))} / {_text(source.get('extraction_status'))} · "
+                                   f"product match {_text(source.get('product_match_status'))}<br/>"
+                                   f"Source triage (not certification): {_text(triage)}", styles["Small"]))
         facts = profile.get("facts") or []
         for fact in facts:
             story.append(Paragraph(f"<b>{_text(fact.get('category'))}</b>: {_text(fact.get('quote'))}<br/>"
@@ -140,8 +150,41 @@ def render_review_report(data: dict[str, Any]) -> bytes:
     if visual:
         results = visual.get("results") or {}
         story.append(Paragraph(f"Status: {_text(visual.get('status'))}. {_text(results.get('message'))}", styles["BodyText"]))
+        if results.get("delta_threshold") is not None:
+            story.append(Paragraph(f"Palette thresholds: ΔE &gt; {_text(results.get('delta_threshold'))}; "
+                                   f"minimum coverage {_text(results.get('coverage_threshold'))}.", styles["Small"]))
         for finding in results.get("findings") or []:
             story.append(Paragraph(_text(finding), styles["Small"]))
+        logos = results.get("logo_analysis") or {}
+        if logos:
+            story.append(Paragraph(f"Approved logo comparison: {_text(logos.get('status'))} · "
+                                   f"{_text(logos.get('assets_examined', 0))} embedded raster asset(s) examined.",
+                                   styles["BodyText"]))
+            for match in logos.get("matches") or []:
+                location = (f"slide/page {match.get('page_number')}" if match.get("page_number") else "location unavailable")
+                coordinates = match.get("coordinates")
+                story.append(Paragraph(f"Logo candidate {_text(match.get('status'))} · {_text(location)} · "
+                                       f"reference {_text(match.get('reference_name'))} · "
+                                       f"similarity {_text(match.get('similarity'))} · "
+                                       f"issues {_text(match.get('issues') or [])}<br/>"
+                                       f"Review state: {_text(match.get('review_status'))}. "
+                                       "Perceptual similarity is a human-review lead, not identity proof.", styles["Small"]))
+                if coordinates:
+                    story.append(Paragraph(f"Coordinates: {_text(coordinates)}", styles["Small"]))
+            for limitation in logos.get("limitations") or []:
+                story.append(Paragraph(_text(limitation), styles["Small"]))
+        for key, label in (("typography_analysis", "Typography"), ("layout_analysis", "Layout")):
+            analysis = results.get(key)
+            if not analysis:
+                continue
+            story.append(Paragraph(f"{_text(label)} checks: {_text(analysis.get('status'))} · "
+                                   f"{_text(analysis.get('message'))}", styles["BodyText"]))
+            for finding in analysis.get("findings") or []:
+                location = f"slide/page {finding.get('page_number')}" if finding.get("page_number") else finding.get("kind", "location unavailable")
+                story.append(Paragraph(f"{_text(location)} · {_text(finding.get('message'))} · "
+                                       f"{_text(finding.get('coordinates') or {})}", styles["Small"]))
+            for limitation in analysis.get("limitations") or []:
+                story.append(Paragraph(_text(limitation), styles["Small"]))
         for limitation in results.get("limitations") or []:
             story.append(Paragraph(_text(limitation), styles["Small"]))
     else:
@@ -160,7 +203,18 @@ def render_review_report(data: dict[str, Any]) -> bytes:
         story.append(Paragraph("No automated decision is recorded for the latest review.", styles["BodyText"]))
     for item in data.get("human_decisions") or []:
         story.append(Paragraph(f"Human decision: {_text(item.get('decision'))} · {_text(item.get('decided_at'))} · "
-                               f"{_text(item.get('comment'))}", styles["BodyText"]))
+                               f"reviewer {_text(item.get('reviewer_email'))} · {_text(item.get('comment'))}", styles["BodyText"]))
+
+    story.append(Paragraph("Review and audit history", styles["Section"]))
+    for item in data.get("review_history") or []:
+        story.append(Paragraph(f"Revision {_text(item.get('version_no'))} · review {_text(item.get('id'))} · "
+                               f"{_text(item.get('status'))} · {_text(item.get('started_at'))} · "
+                               f"{_text(item.get('completed_at'))}", styles["BodyText"]))
+    for item in data.get("audit_history") or []:
+        story.append(Paragraph(f"{_text(item.get('created_at'))} · {_text(item.get('actor_email'))} · "
+                               f"{_text(item.get('event_type'))}: {_text(item.get('summary'))}", styles["Small"]))
+    if not data.get("review_history") and not data.get("audit_history"):
+        story.append(Paragraph("No submission-specific review or audit history is available.", styles["BodyText"]))
 
     def footer(canvas, document):
         canvas.saveState()
@@ -198,26 +252,44 @@ def download_report(submission_id: UUID, m: Member = Depends(member_of()), conn:
                             where a.review_run_id=:r and a.workspace_id=:w order by a.created_at""",
                     r=run["id"] if run else None, w=m.workspace_id) if run else []
     visual = q1(conn, """select status,results from visual_analyses where review_run_id=:r and workspace_id=:w""",
-                r=run["id"], w=m.workspace_id) if run else None
+                r=run["id"], w=m.workspace_id) if run and table_exists(conn, "visual_analyses") else None
     decision = q1(conn, """select outcome,risk_score,rationale,factors,policy_version
                            from automated_decisions where review_run_id=:r and workspace_id=:w""",
                   r=run["id"], w=m.workspace_id) if run else None
-    human = q(conn, """select decision,comment,decided_at from review_decisions
-                       where submission_version_id=:v and workspace_id=:w order by decided_at""",
-              v=submission["version_id"], w=m.workspace_id)
-    product = q1(conn, """select p.product_name,p.brand,p.manufacturer,p.model_number,p.identity_status,
-                          pp.profile
-                   from submission_product_links l join products p on p.id=l.product_id
-                   left join lateral (select profile,coverage from product_profiles where product_id=p.id
-                                      order by version_no desc limit 1) pp on true
-                   where l.submission_version_id=:v and l.workspace_id=:w""",
-                 v=submission["version_id"], w=m.workspace_id)
+    human = q(conn, """select d.decision,d.comment,d.decided_at,u.email reviewer_email,sv.version_no
+                       from review_decisions d join submission_versions sv on sv.id=d.submission_version_id
+                       left join app_users u on u.id=d.decided_by
+                       where sv.submission_id=:s and d.workspace_id=:w order by d.decided_at""",
+              s=submission["submission_id"], w=m.workspace_id)
+    review_history = q(conn, """select r.id,r.status,r.started_at,r.completed_at,sv.version_no
+                              from review_runs r join submission_versions sv on sv.id=r.submission_version_id
+                              where sv.submission_id=:s and r.workspace_id=:w order by r.started_at""",
+                       s=submission["submission_id"], w=m.workspace_id)
+    audit_history = q(conn, """select e.event_type,e.summary,e.created_at,u.email actor_email
+                             from audit_events e left join app_users u on u.id=e.actor_id
+                             where e.workspace_id=:w and
+                               ((e.entity_type='submission' and e.entity_id=:s) or
+                                (e.entity_type='submission_version' and e.entity_id in
+                                  (select id from submission_versions where submission_id=:s)))
+                             order by e.created_at limit 100""",
+                      s=submission["submission_id"], w=m.workspace_id)
+    product = None
+    if all(table_exists(conn, table) for table in
+           ("submission_product_links", "products", "product_profiles")):
+        product = q1(conn, """select p.product_name,p.brand,p.manufacturer,p.model_number,p.identity_status,
+                              pp.profile,pp.coverage
+                       from submission_product_links l join products p on p.id=l.product_id
+                       left join lateral (select profile,coverage from product_profiles where product_id=p.id
+                                          order by version_no desc limit 1) pp on true
+                       where l.submission_version_id=:v and l.workspace_id=:w""",
+                     v=submission["version_id"], w=m.workspace_id)
     payload = {**submission, "review_id": run.get("id") if run else None,
                "review_status": run.get("status") if run else None,
                "stages": run.get("stages") if run else {}, "findings": findings,
                "finding_evidence": finding_evidence, "assessments": assessments,
                "visual_analysis": visual, "automated_decision": decision,
-               "human_decisions": human, "product": product}
+               "human_decisions": human, "review_history": review_history,
+               "audit_history": audit_history, "product": product}
     pdf = render_review_report(payload)
     safe_title = "".join(c for c in (submission["title"] or "submission")
                          if c.isascii() and (c.isalnum() or c in "-_ ")).strip()

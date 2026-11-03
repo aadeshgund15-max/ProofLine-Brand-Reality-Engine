@@ -32,18 +32,21 @@ left join brand_fact_versions fn on i.change_kind = 'fact' and fn.id = i.new_ver
 left join brand_rule_versions ro on i.change_kind = 'rule' and ro.id = i.old_version_id
 left join brand_rule_versions rn on i.change_kind = 'rule' and rn.id = i.new_version_id
 left join app_users u on u.id = i.resolved_by
-where i.workspace_id = :w and (cast(:st as text) is null or i.status = :st)"""
+where i.workspace_id = :w and (cast(:st as text) is null or i.status = :st)
+  and (cast(:bp as uuid) is null or s.brand_profile_id = :bp)"""
 
 
 @router.get("/impacts")
 def list_impacts(status: Optional[str] = Query(None, pattern="^(review_required|resolved)$"),
-                 m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
-    return q(conn, _IMPACT_SQL + " order by i.created_at desc limit 300", w=m.workspace_id, st=status)
+                 m: Member = Depends(member_of()), conn: Connection = Depends(get_conn),
+                 brand_profile_id: Optional[UUID] = Query(None)):
+    return q(conn, _IMPACT_SQL + " order by i.created_at desc limit 300", w=m.workspace_id, st=status, bp=brand_profile_id)
 
 
 @router.get("/impacts/{impact_id}")
-def get_impact(impact_id: UUID, m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
-    row = q1(conn, _IMPACT_SQL + " and i.id = :i", w=m.workspace_id, st=None, i=impact_id)
+def get_impact(impact_id: UUID, m: Member = Depends(member_of()), conn: Connection = Depends(get_conn),
+               brand_profile_id: Optional[UUID] = Query(None)):
+    row = q1(conn, _IMPACT_SQL + " and i.id = :i", w=m.workspace_id, st=None, bp=brand_profile_id, i=impact_id)
     if not row:
         raise HTTPException(404, "Impact record not found")
     return row

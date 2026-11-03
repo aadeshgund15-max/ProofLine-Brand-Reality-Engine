@@ -12,7 +12,7 @@ from app import auth
 from app.audit import audit
 from app.auth import Member, member_of
 from app.core.ssrf import FetchError, UnsafeUrlError, validate_url
-from app.db import ex, get_conn, q, q1
+from app.db import ex, get_conn, q, q1, table_exists
 
 router = APIRouter(prefix="/api/workspaces/{workspace_id}/monitoring")
 
@@ -73,14 +73,17 @@ def _safe_url(url: str) -> str:
 
 
 @router.get("/sources")
-def list_sources(include_removed: bool = False, m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
+def list_sources(include_removed: bool = False, brand_profile_id: Optional[UUID] = Query(None), m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
+    if not table_exists(conn, "monitored_sources"):
+        return []
     return q(conn, """select s.id,s.brand_profile_id,s.product_id,p.product_name,s.url,s.label,s.interval_minutes,s.status,s.last_checked_at,
                              s.next_check_at,s.failure_count,s.created_at,
                              (select count(*) from monitoring_snapshots p where p.monitored_source_id=s.id) snapshot_count,
                              (select count(*) from monitoring_changes c where c.monitored_source_id=s.id and c.status='open') open_changes
                       from monitored_sources s left join products p on p.id=s.product_id
                       where s.workspace_id=:w and (:all or s.status<>'removed')
-                      order by s.created_at desc""", w=m.workspace_id, all=include_removed)
+                        and (cast(:bp as uuid) is null or s.brand_profile_id=:bp)
+                      order by s.created_at desc""", w=m.workspace_id, all=include_removed, bp=brand_profile_id)
 
 
 @router.post("/sources", status_code=201)
@@ -151,7 +154,11 @@ def check_now(source_id: UUID, m: Member = Depends(member_of()), conn: Connectio
 
 @router.get("/changes")
 def list_changes(status: str = Query("open", pattern="^(open|reviewed|dismissed|all)$"),
+                 brand_profile_id: Optional[UUID] = Query(None),
                  m: Member = Depends(member_of()), conn: Connection = Depends(get_conn)):
+    if not all(table_exists(conn, table) for table in
+               ("monitoring_changes", "monitored_sources", "monitoring_snapshots", "monitoring_change_reviews")):
+        return []
     return q(conn, """select c.id,c.monitored_source_id,s.label,s.url,c.previous_snapshot_id,c.current_snapshot_id,
                              p.version_no previous_version,n.version_no current_version,c.change_summary,c.change_excerpt,c.status,c.created_at,
                              r.status review_status,r.outcome,r.risk_score,r.report
@@ -160,7 +167,8 @@ def list_changes(status: str = Query("open", pattern="^(open|reviewed|dismissed|
                       join monitoring_snapshots n on n.id=c.current_snapshot_id
                       left join monitoring_change_reviews r on r.change_id=c.id
                       where c.workspace_id=:w and (:st='all' or c.status=:st)
-                      order by c.created_at desc limit 200""", w=m.workspace_id, st=status)
+                        and (cast(:bp as uuid) is null or s.brand_profile_id=:bp)
+                      order by c.created_at desc limit 200""", w=m.workspace_id, st=status, bp=brand_profile_id)
 
 
 @router.patch("/changes/{change_id}")

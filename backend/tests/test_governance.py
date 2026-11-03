@@ -1,7 +1,10 @@
 import unittest
+import json
+import os
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from app.core.governance import assess_review
+from app.core.governance import assess_review, load_governance_policy
 
 
 class GovernanceTests(unittest.TestCase):
@@ -64,6 +67,29 @@ class GovernanceTests(unittest.TestCase):
         )
         self.assertEqual(result.outcome, "on_hold")
         self.assertIn("product_intelligence", result.rationale)
+
+    def test_custom_policy_weights_and_version_are_persisted_in_result(self):
+        with patch.dict(os.environ, {"PROOFLINE_GOVERNANCE_POLICY_JSON": json.dumps({
+            "version": "review-policy-2026-11",
+            "weights": {"missing_user_proof": 42},
+        })}):
+            result = assess_review(
+                findings=[],
+                stages={"deterministic": {"status": "completed"}, "verification": {"status": "completed"},
+                        "visual": {"status": "completed"}, "proof_provenance": {"status": "completed"},
+                        "product_intelligence": {"status": "completed"}},
+                extraction_status="complete",
+                evidence_assessments=[],
+            )
+        self.assertEqual(result.outcome, "on_hold")
+        self.assertEqual(result.policy_version, "review-policy-2026-11")
+        factor = next(item for item in result.factors if item["code"] == "missing_user_proof")
+        self.assertEqual(factor["weight"], 42)
+
+    def test_invalid_policy_configuration_fails_clearly(self):
+        with patch.dict(os.environ, {"PROOFLINE_GOVERNANCE_POLICY_JSON": '{"weights":{"unrecognized":5}}'}):
+            with self.assertRaisesRegex(ValueError, "unknown or invalid"):
+                load_governance_policy()
 
 
 if __name__ == "__main__":

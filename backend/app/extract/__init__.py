@@ -211,7 +211,7 @@ def extract_pdf(data: bytes) -> ExtractionResult:
     pages: list[str] = []
     try:
         try:
-            import fitz  # PyMuPDF (preferred)
+            import pymupdf as fitz  # PyMuPDF (preferred; avoid the deprecated fitz alias)
             doc = fitz.open(stream=data, filetype="pdf")
             if doc.needs_pass:
                 return _failed("pdf", "The PDF is password protected.")

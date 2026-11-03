@@ -17,11 +17,21 @@ describe('Proofline API client', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
   it('uses the backend /api route and forwards the Supabase bearer token', async () => {
-    vi.mocked(fetch).mockResolvedValue(new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify([{ id: 'brand-1', name: 'User supplied brand' }]), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } }))
     await expect(submissionApi.list('workspace-1')).resolves.toEqual([])
-    const [url, options] = vi.mocked(fetch).mock.calls[0]
-    expect(String(url)).toMatch(/\/api\/workspaces\/workspace-1\/submissions$/)
+    const [url, options] = vi.mocked(fetch).mock.calls[1]
+    expect(String(url)).toMatch(/\/api\/workspaces\/workspace-1\/submissions(?:\?|$)/)
+    expect(String(url)).toContain('brand_profile_id=brand-1')
     expect(new Headers(options?.headers).get('Authorization')).toBe('Bearer supabase-access-token')
+  })
+
+  it('requires a brand profile instead of creating generic business data', async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await expect(submissionApi.list('workspace-1')).rejects.toMatchObject({ name: 'ApiError', message: expect.stringContaining('Create a brand profile') })
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(String(vi.mocked(fetch).mock.calls[0][0])).toMatch(/\/profiles$/)
   })
 
   it('surfaces network failures instead of returning fixture records', async () => {
